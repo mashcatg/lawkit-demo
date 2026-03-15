@@ -7,6 +7,7 @@ import { ChatInput } from "@/components/chat/ChatInput";
 import { MessageBubble } from "@/components/chat/MessageBubble";
 import { SourcesPanel } from "@/components/chat/SourcesPanel";
 import { DocumentEditor } from "@/components/editor/DocumentEditor";
+import { RedlineView } from "@/components/editor/RedlineView";
 import { SheetEditor } from "@/components/editor/SheetEditor";
 import type { SheetData } from "@/components/editor/SheetEditor";
 import { ScrollArea } from "@/components/ui/scroll-area";
@@ -14,6 +15,8 @@ import { Skeleton } from "@/components/ui/skeleton";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
+import { parseRedFlags } from "@/components/chat/RedFlagCard";
+import type { RedFlagData } from "@/components/chat/RedFlagCard";
 import { Textarea } from "@/components/ui/textarea";
 import {
   Dialog,
@@ -91,6 +94,7 @@ export default function Chat() {
   const [promptMode, setPromptMode] = useState<string | undefined>();
   const [editorDoc, setEditorDoc] = useState<{ title: string; content: string } | null>(null);
   const [sheetDoc, setSheetDoc] = useState<SheetData | null>(null);
+  const [redFlagData, setRedFlagData] = useState<import("@/components/chat/RedFlagCard").RedFlagData | null>(null);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [editTitleValue, setEditTitleValue] = useState("");
   const [selectionTooltip, setSelectionTooltip] = useState<{ x: number; y: number; text: string } | null>(null);
@@ -99,13 +103,67 @@ export default function Chat() {
   const [workflowTag, setWorkflowTag] = useState<{ title: string; systemPrompt?: string } | null>(null);
   const [isProcessingFiles, setIsProcessingFiles] = useState(false);
   const [replyContext, setReplyContext] = useState<string | null>(null);
-  // Track attached file IDs for Uploads vault scoping across messages
+  // Track attached file IDs and names for Uploads vault scoping across messages
   const [conversationAttachedFileIds, setConversationAttachedFileIds] = useState<string[]>([]);
+  const [conversationAttachedFileNames, setConversationAttachedFileNames] = useState<string[]>([]);
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [highlightExcerpt, setHighlightExcerpt] = useState<string | undefined>();
   const fileInputRef = useRef<HTMLInputElement>(null);
   const messagesContainerRef = useRef<HTMLDivElement>(null);
   const isReplyingRef = useRef(false);
+
+  // Persist prompt state to localStorage (survives reload)
+  const storageKey = conversationId ? `chat_state_${conversationId}` : "chat_state_new";
+  const saveEnabledRef = useRef(false);
+
+  // Save prompt state on changes — but only after initial hydration
+  useEffect(() => {
+    if (!saveEnabledRef.current) return;
+    const state = {
+      input,
+      deepResearch,
+      activeSources,
+      promptMode,
+      selectedVault,
+      workflowTag,
+      replyContext,
+      conversationAttachedFileIds,
+      conversationAttachedFileNames,
+    };
+    try { localStorage.setItem(storageKey, JSON.stringify(state)); } catch {}
+  }, [input, deepResearch, activeSources, promptMode, selectedVault, workflowTag, replyContext, storageKey, conversationAttachedFileIds, conversationAttachedFileNames]);
+
+  // Restore prompt state on mount / conversation change — hydrate first, THEN enable saves
+  const hasRestoredRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (hasRestoredRef.current === storageKey) return;
+    hasRestoredRef.current = storageKey;
+    saveEnabledRef.current = false; // Prevent save from overwriting during hydration
+    try {
+      const saved = localStorage.getItem(storageKey);
+      if (!saved) {
+        saveEnabledRef.current = true;
+        return;
+      }
+      const state = JSON.parse(saved);
+      if (state.input) setInput(state.input);
+      if (state.deepResearch !== undefined) setDeepResearch(state.deepResearch);
+      if (state.activeSources?.length) setActiveSources(state.activeSources);
+      if (state.promptMode) setPromptMode(state.promptMode);
+      if (state.selectedVault) {
+        setSelectedVault(state.selectedVault);
+        setVaultId(state.selectedVault.id);
+        setVaultName(state.selectedVault.name);
+      }
+      if (state.workflowTag) setWorkflowTag(state.workflowTag);
+      if (state.replyContext) setReplyContext(state.replyContext);
+      // Restore attached file context
+      if (state.conversationAttachedFileIds?.length) setConversationAttachedFileIds(state.conversationAttachedFileIds);
+      if (state.conversationAttachedFileNames?.length) setConversationAttachedFileNames(state.conversationAttachedFileNames);
+    } catch {}
+    // Enable saves after hydration completes
+    requestAnimationFrame(() => { saveEnabledRef.current = true; });
+  }, [storageKey]);
 
   // Load vaults for sources dropdown
   useEffect(() => {
@@ -239,9 +297,30 @@ export default function Chat() {
         .order("created_at", { ascending: true });
 
       if (msgs?.length) {
+        // Track latest user message metadata for UI state restoration
+        let latestUserMeta: any = null;
+
         loadHistory(
           msgs.map((m) => {
             const meta = (m as any).metadata || {};
+
+            // For user messages, reconstruct attachments from persisted metadata
+            if (m.role === "user" && Object.keys(meta).length > 0) {
+              latestUserMeta = meta;
+            }
+
+            const attachments: any = {};
+            if (m.role === "user") {
+              if (meta.vaultName) attachments.vaultName = meta.vaultName;
+              if (meta.vaultId) attachments.vaultId = meta.vaultId;
+              if (meta.attachedFileNames?.length) attachments.fileNames = meta.attachedFileNames;
+              if (meta.attachedFileIds?.length) attachments.fileIds = meta.attachedFileIds;
+              if (meta.promptMode) attachments.promptMode = meta.promptMode;
+              if (meta.sources?.length) attachments.sources = meta.sources;
+              if (meta.deepResearch) attachments.deepResearch = true;
+              if (meta.workflowTitle) attachments.workflowTitle = meta.workflowTitle;
+            }
+
             return {
               id: m.id,
               role: m.role as "user" | "assistant",
@@ -250,6 +329,7 @@ export default function Chat() {
               citations: (m.citations as any) || undefined,
               model: m.model_used || undefined,
               followUps: meta.followUps || undefined,
+              attachments: Object.keys(attachments).length > 0 ? attachments : undefined,
               frozenSteps: meta.frozenSteps || undefined,
               frozenPlan: meta.frozenPlan || undefined,
               frozenThinkingText: meta.frozenThinkingText || undefined,
@@ -259,6 +339,29 @@ export default function Chat() {
             };
           })
         );
+
+        // Restore prompt UI state from latest user message metadata (if localStorage is stale/missing)
+        if (latestUserMeta) {
+          // Use conversation-specific key directly (storageKey may still point to old conv)
+          const convStorageKey = `chat_state_${convId}`;
+          const savedState = (() => { try { return JSON.parse(localStorage.getItem(convStorageKey) || "{}"); } catch { return {}; } })();
+          // Only restore from DB if localStorage doesn't have values
+          if (!savedState.promptMode && latestUserMeta.promptMode) setPromptMode(latestUserMeta.promptMode);
+          if (!savedState.activeSources?.length && latestUserMeta.sources?.length) setActiveSources(latestUserMeta.sources);
+          if (!savedState.deepResearch && latestUserMeta.deepResearch) setDeepResearch(true);
+          if (!savedState.selectedVault && latestUserMeta.vaultId && latestUserMeta.vaultName) {
+            const v = { id: latestUserMeta.vaultId, name: latestUserMeta.vaultName };
+            setSelectedVault(v);
+            setVaultId(v.id);
+            setVaultName(v.name);
+          }
+          if (!savedState.conversationAttachedFileIds?.length && latestUserMeta.attachedFileIds?.length) {
+            setConversationAttachedFileIds(latestUserMeta.attachedFileIds);
+          }
+          if (!savedState.conversationAttachedFileNames?.length && latestUserMeta.attachedFileNames?.length) {
+            setConversationAttachedFileNames(latestUserMeta.attachedFileNames);
+          }
+        }
       }
     } finally {
       setIsLoadingConversation(false);
@@ -296,8 +399,9 @@ export default function Chat() {
         const effectiveVaultName = vName || "Uploads";
         setVaultId(effectiveVault);
         setVaultName(effectiveVaultName);
-        // Track attached file IDs for subsequent messages
+        // Track attached file IDs and names for subsequent messages
         setConversationAttachedFileIds(preProcessedFileIds);
+        setConversationAttachedFileNames(preProcessedFileNames);
         createConversationAndSend(msg, effectiveVault, deep, srcs, pMode, effectiveVaultName, wfTag?.systemPrompt, preProcessedFileIds, preProcessedFileNames);
       } else {
         createConversationAndSend(msg, vault, deep, srcs, pMode, vName, wfTag?.systemPrompt);
@@ -366,7 +470,7 @@ export default function Chat() {
       container.removeEventListener("mouseup", handleMouseUp);
       document.removeEventListener("mousedown", handleMouseDown);
     };
-  }, []);
+  }, [messages.length > 0]);
 
   const handleReplyWithSelection = () => {
     if (!selectionTooltip) return;
@@ -382,6 +486,93 @@ export default function Chat() {
       toast({ title: "Error", description: error, variant: "destructive" });
     }
   }, [error]);
+
+  // Auto-open document in redline view after red flag analysis completes
+  const prevStreamingRef = useRef(false);
+
+  // Helper: robustly load file content with 3-tier fallback, then atomically set both states
+  const openRedFlagPanel = useCallback(async (rfData: RedFlagData, fileName: string, fileId?: string) => {
+    if (!profile?.organization_id) return;
+
+    // Tier 1: files table extracted_text
+    let content: string | null = null;
+    let resolvedName = fileName;
+
+    if (fileId) {
+      const { data } = await supabase.from("files").select("name, extracted_text").eq("id", fileId).maybeSingle();
+      if (data?.extracted_text) { content = data.extracted_text; resolvedName = data.name || fileName; }
+    }
+
+    if (!content) {
+      const { data } = await supabase.from("files").select("name, extracted_text").eq("organization_id", profile.organization_id).eq("name", fileName).maybeSingle();
+      if (data?.extracted_text) { content = data.extracted_text; resolvedName = data.name || fileName; }
+    }
+
+    // Tier 2: file_chunks table concatenated
+    if (!content && fileId) {
+      const { data: chunks } = await supabase
+        .from("file_chunks")
+        .select("content, chunk_index")
+        .eq("file_id", fileId)
+        .order("chunk_index", { ascending: true })
+        .limit(200);
+      if (chunks && chunks.length > 0) {
+        content = chunks.map(c => c.content).join("\n\n");
+      }
+    }
+
+    if (!content && !fileId) {
+      // Try to find file by name, then load chunks
+      const { data: fileRow } = await supabase.from("files").select("id").eq("organization_id", profile.organization_id).eq("name", fileName).maybeSingle();
+      if (fileRow) {
+        const { data: chunks } = await supabase
+          .from("file_chunks")
+          .select("content, chunk_index")
+          .eq("file_id", fileRow.id)
+          .order("chunk_index", { ascending: true })
+          .limit(200);
+        if (chunks && chunks.length > 0) {
+          content = chunks.map(c => c.content).join("\n\n");
+        }
+      }
+    }
+
+    // Tier 3: placeholder
+    if (!content) {
+      content = "Document is still being processed. The redline view will update when processing completes.";
+    }
+
+    // Atomic update — set both states together so the panel always renders
+    setRedFlagData(rfData);
+    setEditorDoc({ title: resolvedName, content });
+  }, [profile?.organization_id]);
+
+  useEffect(() => {
+    if (prevStreamingRef.current && !isStreaming) {
+      // Streaming just finished — check if last assistant message has red flags
+      const lastAssistant = [...messages].reverse().find(m => m.role === "assistant");
+      if (lastAssistant) {
+      const rfData = parseRedFlags(lastAssistant.content);
+        if (rfData && rfData.flags.length > 0) {
+          const refs = (lastAssistant as any).frozenFileRefs || fileRefs;
+          // Try title-based matching first
+          const titleMatch = refs?.find((r: any) => rfData.title?.toLowerCase().includes(r.name?.toLowerCase()?.replace(/\.[^.]+$/, "")));
+          const bestRef = titleMatch || refs?.[0];
+          if (bestRef) {
+            openRedFlagPanel(rfData, bestRef.name, bestRef.id);
+          } else if (conversationAttachedFileIds.length > 0) {
+            openRedFlagPanel(rfData, conversationAttachedFileNames[0] || "document", conversationAttachedFileIds[0]);
+          } else {
+            // No file ref at all — still open the panel with flag data
+            setRedFlagData(rfData);
+            setEditorDoc({ title: rfData.title || "Document", content: "Original document content unavailable." });
+          }
+        }
+      }
+    }
+    prevStreamingRef.current = isStreaming;
+  }, [isStreaming, messages.length]);
+
 
   const lastStreamOptions = useRef<any>(null);
 
@@ -430,6 +621,7 @@ export default function Chat() {
       currentDocumentContent: editorDoc?.content,
       attachedFileIds,
       attachedFileNames,
+      workflowTitle: workflowTag?.title,
     };
     lastStreamOptions.current = opts;
     sendMessage(msg, opts);
@@ -449,8 +641,16 @@ export default function Chat() {
     }
     if (!text) setInput("");
 
+    // If user has pending attached files that haven't been uploaded yet, process them now
+    if (attachedFiles.length > 0 && conversationAttachedFileIds.length === 0) {
+      await processAndSendWithFiles(msg);
+      return;
+    }
+
     if (!conversationId) {
-      await createConversationAndSend(msg, vaultId, deepResearch, activeSources, promptMode);
+      const fileIds = conversationAttachedFileIds.length > 0 ? conversationAttachedFileIds : undefined;
+      const fileNames = conversationAttachedFileNames.length > 0 ? conversationAttachedFileNames : undefined;
+      await createConversationAndSend(msg, vaultId, deepResearch, activeSources, promptMode, vaultName, workflowTag?.systemPrompt, fileIds, fileNames);
     } else {
       const opts: any = {
         conversationId,
@@ -465,8 +665,9 @@ export default function Chat() {
         currentDocumentContent: editorDoc?.content,
       };
       // For Uploads vault, scope to the originally attached files
-      if (vaultName === "Uploads" && conversationAttachedFileIds.length > 0) {
+      if ((vaultName === "Uploads" || vaultName === "Prompt Uploads") && conversationAttachedFileIds.length > 0) {
         opts.attachedFileIds = conversationAttachedFileIds;
+        opts.attachedFileNames = conversationAttachedFileNames;
       }
       lastStreamOptions.current = opts;
       sendMessage(msg, opts);
@@ -483,18 +684,14 @@ export default function Chat() {
     const scrollTop = viewport?.scrollTop || 0;
 
     setHighlightExcerpt(excerpt);
-    
-    // If same title, append as new version
-    if (editorDoc?.title === title && !excerpt) {
-      setEditorDoc(null); // toggle off
-    } else {
-      setEditorDoc({ title, content });
-    }
+    setEditorDoc({ title, content }); // Always replace, never toggle
 
     requestAnimationFrame(() => {
-      if (viewport) viewport.scrollTop = scrollTop;
+      requestAnimationFrame(() => {
+        if (viewport) viewport.scrollTop = scrollTop;
+      });
     });
-  }, [editorDoc]);
+  }, []);
 
   const handleSheetOpen = useCallback((data: SheetData) => {
     const container = scrollContainerRef.current;
@@ -515,42 +712,157 @@ export default function Chat() {
 
   const handleFileClick = useCallback(async (fileName: string, fileId?: string, excerpt?: string) => {
     if (!profile?.organization_id) return;
-    const query = supabase.from("files").select("name, extracted_text").eq("organization_id", profile.organization_id);
+
+    let data: any = null;
+
     if (fileId) {
-      query.eq("id", fileId);
-    } else {
-      query.eq("name", fileName);
+      const { data: d } = await supabase.from("files").select("name, extracted_text").eq("organization_id", profile.organization_id).eq("id", fileId).maybeSingle();
+      data = d;
     }
-    const { data } = await query.maybeSingle();
+
+    if (!data) {
+      // Exact name match
+      const { data: d } = await supabase.from("files").select("name, extracted_text").eq("organization_id", profile.organization_id).eq("name", fileName).maybeSingle();
+      data = d;
+    }
+
+    if (!data) {
+      // Fuzzy match: strip extensions, chunk suffixes, try ilike
+      const baseName = fileName.replace(/\s*[-–—]\s*(chunk|part|section)\s*\d+.*/i, "").replace(/\.[^.]+$/, "").trim();
+      if (baseName.length > 3) {
+        const { data: d } = await supabase.from("files").select("name, extracted_text").eq("organization_id", profile.organization_id).ilike("name", `%${baseName}%`).limit(1).maybeSingle();
+        data = d;
+      }
+    }
+
     if (data?.extracted_text) {
       handleDocumentOpen(data.name || fileName, data.extracted_text, excerpt);
     }
   }, [profile?.organization_id, handleDocumentOpen]);
 
+  // Active flag index for scroll sync with RedlineView
+  const [activeFlagIndex, setActiveFlagIndex] = useState<number | null>(null);
+
+  // Callback for "Open in Editor" from RedFlagCard — uses 3-tier fallback
+  const handleRedFlagOpen = useCallback((data: RedFlagData, fileName: string, fileId?: string) => {
+    openRedFlagPanel(data, fileName, fileId);
+  }, [openRedFlagPanel]);
+
+  // Callback for flag card click → scroll sync
+  const handleFlagClick = useCallback((index: number) => {
+    setActiveFlagIndex(index);
+  }, []);
+
+
   const handleFileSelect = useCallback(() => {
     fileInputRef.current?.click();
   }, []);
 
+  // Defer file upload — only add to local state on selection, upload on submit
   const handleFilesSelected = useCallback(async (files: File[]) => {
     if (!files.length) return;
     setAttachedFiles(prev => [...prev, ...files]);
+    // No upload, no toast — files will be processed on submit
+  }, []);
+
+  // Process files and send message — called from handleSend when attachedFiles exist
+  const processAndSendWithFiles = useCallback(async (msg: string) => {
+    if (!attachedFiles.length) return;
     setIsProcessingFiles(true);
     try {
-      const result = await processAttachedFiles(files);
+      const result = await processAttachedFiles(attachedFiles);
       setConversationAttachedFileIds(prev => [...prev, ...result.fileIds]);
+      setConversationAttachedFileNames(prev => [...prev, ...attachedFiles.map(f => f.name)]);
       setVaultId(result.vaultId);
       setVaultName("Uploads");
-      toast({ title: "Files attached", description: `${files.length} file${files.length > 1 ? 's' : ''} uploaded and processing.` });
+
+      // Poll until all files are ready (max 60s)
+      const deadline = Date.now() + 60_000;
+      let allReady = false;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, 2000));
+        const { data: statuses } = await supabase
+          .from("files")
+          .select("id, status")
+          .in("id", result.fileIds);
+        if (statuses && statuses.every(f => f.status === "ready" || f.status === "error")) {
+          allReady = true;
+          break;
+        }
+      }
+      if (!allReady) {
+        toast({ title: "Processing", description: "Some files are still processing. The AI may not see all content yet." });
+      }
+
+      // Now send the message with the processed file IDs
+      setAttachedFiles([]);
+      if (!conversationId) {
+        await createConversationAndSend(msg, result.vaultId, deepResearch, activeSources, promptMode, "Uploads", workflowTag?.systemPrompt, result.fileIds, result.fileIds.map((_, i) => attachedFiles[i]?.name || "file"));
+      } else {
+        const opts: any = {
+          conversationId,
+          organizationId: profile!.organization_id!,
+          vaultId: result.vaultId,
+          vaultName: "Uploads",
+          deepResearch,
+          sources: activeSources,
+          useCase: promptMode,
+          currentSheetState: sheetDoc,
+          workflowSystemPrompt: workflowTag?.systemPrompt,
+          currentDocumentContent: editorDoc?.content,
+          attachedFileIds: result.fileIds,
+          attachedFileNames: attachedFiles.map(f => f.name),
+        };
+        lastStreamOptions.current = opts;
+        sendMessage(msg, opts);
+      }
     } catch (err: any) {
       toast({ title: "Upload failed", description: err.message, variant: "destructive" });
     } finally {
       setIsProcessingFiles(false);
     }
-  }, [processAttachedFiles, toast]);
+  }, [attachedFiles, processAttachedFiles, toast, conversationId, deepResearch, activeSources, promptMode, workflowTag, sheetDoc, editorDoc, profile]);
 
   const removeAttachedFile = useCallback((index: number) => {
     setAttachedFiles(prev => prev.filter((_, i) => i !== index));
   }, []);
+
+  const handleEditMessage = useCallback(async (messageId: string, newContent: string) => {
+    if (!conversationId || !profile?.organization_id || isStreaming) return;
+    // Update message content in Supabase
+    await supabase.from("messages").update({ content: newContent }).eq("id", messageId);
+    // Remove all messages after this one from local state + DB
+    const msgIndex = messages.findIndex(m => m.id === messageId);
+    if (msgIndex === -1) return;
+    const msgsToDelete = messages.slice(msgIndex + 1);
+    for (const m of msgsToDelete) {
+      await supabase.from("messages").delete().eq("id", m.id);
+    }
+    // Reload and re-send
+    loadHistory(messages.slice(0, msgIndex).map(m => ({
+      id: m.id, role: m.role, content: m.content,
+      reasoning: m.reasoning, citations: m.citations, model: m.model,
+      followUps: m.followUps, frozenSteps: m.frozenSteps, frozenPlan: m.frozenPlan,
+      frozenThinkingText: m.frozenThinkingText, frozenSearchSources: m.frozenSearchSources,
+      frozenFileRefs: m.frozenFileRefs, createdAt: m.createdAt,
+    })));
+    // Re-send the edited message
+    const opts = {
+      conversationId,
+      organizationId: profile.organization_id!,
+      vaultId,
+      vaultName,
+      deepResearch,
+      sources: activeSources,
+      useCase: promptMode,
+      currentSheetState: sheetDoc,
+      workflowSystemPrompt: workflowTag?.systemPrompt,
+      currentDocumentContent: editorDoc?.content,
+      ...(vaultName === "Uploads" && conversationAttachedFileIds.length > 0 ? { attachedFileIds: conversationAttachedFileIds, attachedFileNames: conversationAttachedFileNames } : {}),
+    };
+    lastStreamOptions.current = opts;
+    sendMessage(newContent, opts);
+  }, [conversationId, profile, isStreaming, messages, vaultId, vaultName, deepResearch, activeSources, promptMode, sheetDoc, workflowTag, editorDoc, conversationAttachedFileIds, loadHistory, sendMessage]);
 
   const handleRegenerate = () => {
     if (!lastStreamOptions.current || isStreaming) return;
@@ -564,6 +876,7 @@ export default function Chat() {
     setEditorDoc(null);
     setSheetDoc(null);
     setConversationAttachedFileIds([]);
+    setConversationAttachedFileNames([]);
     initialMessageSentRef.current = false;
     clearMessages();
     navigate("/chat", { replace: true });
@@ -591,17 +904,18 @@ export default function Chat() {
 
   const handleExport = () => {
     if (!messages.length) return;
-    const md = messages
-      .map((m) => `## ${m.role === "user" ? "You" : "LawKit AI"}\n\n${m.content}`)
-      .join("\n\n---\n\n");
-    const blob = new Blob([md], { type: "text/markdown" });
+    const lines = messages
+      .map((m) => `${m.role === "user" ? "You" : "LawKit AI"}:\n${m.content}`)
+      .join("\n\n" + "─".repeat(40) + "\n\n");
+    const header = `${conversationTitle}\nExported ${new Date().toLocaleDateString()}\n${"═".repeat(40)}\n\n`;
+    const blob = new Blob([header + lines], { type: "text/plain" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = `${conversationTitle.replace(/[^a-zA-Z0-9]/g, "_")}.md`;
+    a.download = `${conversationTitle.replace(/[^a-zA-Z0-9]/g, "_")}.txt`;
     a.click();
     URL.revokeObjectURL(url);
-    toast({ title: "Exported", description: "Conversation downloaded as Markdown" });
+    toast({ title: "Exported", description: "Conversation downloaded as text file" });
   };
 
   const [showShareDialog, setShowShareDialog] = useState(false);
@@ -656,16 +970,34 @@ export default function Chat() {
   const rightPanel = sheetDoc ? (
     <SheetEditor
       data={sheetDoc}
-      onClose={() => {
+    onClose={() => {
         const container = scrollContainerRef.current;
         const viewport = container?.querySelector?.('[data-radix-scroll-area-viewport]') as HTMLElement | null;
         const scrollTop = viewport?.scrollTop || 0;
         setSheetDoc(null);
-        requestAnimationFrame(() => {
+        requestAnimationFrame(() => { requestAnimationFrame(() => {
           if (viewport) viewport.scrollTop = scrollTop;
-        });
+        }); });
       }}
       onUpdate={(updated) => setSheetDoc(updated)}
+    />
+  ) : editorDoc && redFlagData ? (
+    <RedlineView
+      title={editorDoc.title}
+      content={editorDoc.content}
+      redFlagData={redFlagData}
+      activeFlagIndex={activeFlagIndex}
+      onClose={() => {
+        setEditorDoc(null);
+        setRedFlagData(null);
+        setHighlightExcerpt(undefined);
+        setActiveFlagIndex(null);
+      }}
+      onContentUpdate={(newContent) => {
+        setEditorDoc({ ...editorDoc, content: newContent });
+        setRedFlagData(null);
+        setActiveFlagIndex(null);
+      }}
     />
   ) : editorDoc ? (
     <DocumentEditor
@@ -673,15 +1005,16 @@ export default function Chat() {
       content={editorDoc.content}
       highlightExcerpt={highlightExcerpt}
       appendVersion={true}
+      onSelectionReply={(text) => setReplyContext(text)}
       onClose={() => {
         const container = scrollContainerRef.current;
         const viewport = container?.querySelector?.('[data-radix-scroll-area-viewport]') as HTMLElement | null;
         const scrollTop = viewport?.scrollTop || 0;
         setEditorDoc(null);
         setHighlightExcerpt(undefined);
-        requestAnimationFrame(() => {
+        requestAnimationFrame(() => { requestAnimationFrame(() => {
           if (viewport) viewport.scrollTop = scrollTop;
-        });
+        }); });
       }}
     />
   ) : undefined;
@@ -889,6 +1222,9 @@ export default function Chat() {
                         planUpdateReason={isCurrentlyStreaming ? planUpdateReason : null}
                         progress={isCurrentlyStreaming ? progress : null}
                         onFileClick={handleFileClick}
+                        onRedFlagOpen={handleRedFlagOpen}
+                        onFlagClick={handleFlagClick}
+                        onEditMessage={handleEditMessage}
                       />
 
                       {isLastUser && showStreamingIndicator && (
@@ -989,6 +1325,7 @@ export default function Chat() {
                 onRemoveReply={() => setReplyContext(null)}
                 isProcessingFiles={isProcessingFiles}
                 onFileSelect={handleFileSelect}
+                onFilesDropped={handleFilesSelected}
                 attachedFiles={attachedFiles}
                 onRemoveFile={removeAttachedFile}
               />
@@ -1000,6 +1337,7 @@ export default function Chat() {
           <SourcesPanel
             citations={allCitations}
             onClose={() => setShowSources(false)}
+            onFileClick={handleFileClick}
           />
         )}
       </div>

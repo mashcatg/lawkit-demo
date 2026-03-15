@@ -394,9 +394,6 @@ export function SheetEditor({ data, onClose, onUpdate }: SheetEditorProps) {
                     </Popover>
                   </th>
                 ))}
-                <th className="px-3 py-2.5 text-left font-medium text-muted-foreground w-[80px]">
-                  Status
-                </th>
               </tr>
             </thead>
             <tbody>
@@ -438,8 +435,14 @@ export function SheetEditor({ data, onClose, onUpdate }: SheetEditorProps) {
                             autoFocus
                           />
                         ) : (
-                          <span className={cn("block truncate max-w-[200px]", !val && "text-muted-foreground italic")}>
-                            {val || "—"}
+                          <span className={cn(
+                            "block truncate max-w-[200px]",
+                            !val && "text-muted-foreground italic",
+                            (val && (val.toLowerCase().includes("not found in document") || val.toLowerCase() === "not found")) && "text-muted-foreground italic"
+                          )}>
+                            {(val && (val.toLowerCase().includes("not found in document") || val.toLowerCase() === "not found"))
+                              ? "Not found in document"
+                              : val || "—"}
                           </span>
                         )}
                         {changed && prevVal && (
@@ -455,14 +458,6 @@ export function SheetEditor({ data, onClose, onUpdate }: SheetEditorProps) {
                       </td>
                     );
                   })}
-                  <td className="px-3 py-2">
-                    <Badge
-                      variant={row.status === "completed" ? "secondary" : row.status === "error" ? "destructive" : "outline"}
-                      className="text-[8px] py-0 px-1.5"
-                    >
-                      {row.status}
-                    </Badge>
-                  </td>
                 </tr>
               ))}
             </tbody>
@@ -568,13 +563,6 @@ function ColumnBuilderDialog({
               className="text-sm min-h-[60px]"
               rows={2}
             />
-          </div>
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-medium text-muted-foreground">AI Auto-fill</label>
-            <div className="flex items-center gap-2">
-              <span className="text-[10px] text-muted-foreground">{fillMode === "ai" ? "AI fills" : "Manual"}</span>
-              <Switch checked={fillMode === "ai"} onCheckedChange={(v) => setFillMode(v ? "ai" : "manual")} />
-            </div>
           </div>
         </div>
         <DialogFooter>

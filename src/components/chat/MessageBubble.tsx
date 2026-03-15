@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useCallback } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { cn } from "@/lib/utils";
@@ -13,9 +13,10 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { useToast } from "@/hooks/use-toast";
-import { FileText, Bot, Copy, Pencil, Database, Paperclip, Table2, BookOpen, ChevronDown, ChevronRight } from "lucide-react";
+import { FileText, Bot, Copy, Pencil, Database, Paperclip, Table2, BookOpen, ChevronDown, ChevronRight, Shield, Loader2, Check, X } from "lucide-react";
 import type { ChatMessage, Citation, AgentStep, SearchSource, FileRef, InlineDataTable, Contradiction, Verification, Escalation, IntentData } from "@/hooks/useStreamChat";
 import type { SheetData } from "@/components/editor/SheetEditor";
+import { RedFlagCard, parseRedFlags } from "./RedFlagCard";
 
 interface MessageBubbleProps {
   message: ChatMessage;
@@ -44,6 +45,8 @@ interface MessageBubbleProps {
   planUpdateReason?: string | null;
   progress?: { current: number; total: number } | null;
   onFileClick?: (fileName: string, fileId?: string, excerpt?: string) => void;
+  onRedFlagOpen?: (data: import("./RedFlagCard").RedFlagData, fileName: string, fileId?: string) => void;
+  onFlagClick?: (index: number) => void;
 }
 
 /** User message action bar (edit, copy) */
@@ -81,22 +84,48 @@ function UserMessageActions({ content, onEdit }: { content: string; onEdit?: () 
   );
 }
 
-/** Attachment badges (vault, files) shown under user messages */
-function AttachmentBadges({ attachments }: { attachments: ChatMessage["attachments"] }) {
+/** Attachment badges (vault, files, config tags) shown under user messages */
+function AttachmentBadges({ attachments, onFileClick }: { attachments: ChatMessage["attachments"]; onFileClick?: (fileName: string) => void }) {
   if (!attachments) return null;
-  const { vaultName, fileNames } = attachments;
-  if (!vaultName && (!fileNames || fileNames.length === 0)) return null;
+  const { vaultName, fileNames, fileIds, promptMode, sources, deepResearch, workflowTitle } = attachments as any;
+  const hasAnything = vaultName || (fileNames && fileNames.length > 0) || promptMode || (sources && sources.length > 0) || deepResearch || workflowTitle;
+  if (!hasAnything) return null;
 
   return (
     <div className="flex flex-wrap gap-1.5 mt-1.5">
+      {promptMode && (
+        <Badge variant="secondary" className="text-[10px] py-0 px-1.5 gap-1 font-normal">
+          {promptMode}
+        </Badge>
+      )}
+      {deepResearch && (
+        <Badge variant="secondary" className="text-[10px] py-0 px-1.5 gap-1 font-normal bg-primary/10 text-primary border-primary/20">
+          Deep Research
+        </Badge>
+      )}
+      {workflowTitle && (
+        <Badge variant="secondary" className="text-[10px] py-0 px-1.5 gap-1 font-normal">
+          {workflowTitle}
+        </Badge>
+      )}
       {vaultName && (
         <Badge variant="secondary" className="text-[10px] py-0 px-1.5 gap-1 font-normal">
           <Database className="h-2.5 w-2.5" />
           {vaultName}
         </Badge>
       )}
-      {fileNames?.map((name, i) => (
-        <Badge key={i} variant="outline" className="text-[10px] py-0 px-1.5 gap-1 font-normal">
+      {sources?.map((src: string, i: number) => (
+        <Badge key={`src-${i}`} variant="outline" className="text-[10px] py-0 px-1.5 gap-1 font-normal">
+          {src}
+        </Badge>
+      ))}
+      {fileNames?.map((name: string, i: number) => (
+        <Badge
+          key={i}
+          variant="outline"
+          className="text-[10px] py-0 px-1.5 gap-1 font-normal cursor-pointer hover:bg-muted/50 transition-colors"
+          onClick={() => onFileClick?.(name)}
+        >
           <Paperclip className="h-2.5 w-2.5" />
           {name}
         </Badge>
@@ -118,16 +147,17 @@ function superscriptToNumber(s: string): number {
 
 function processChildren(
   children: React.ReactNode,
-  citations: Citation[]
+  citations: Citation[],
+  onFileClick?: (fileName: string, fileId?: string, excerpt?: string) => void
 ): React.ReactNode {
   return React.Children.map(children, (child) => {
     if (typeof child === "string") {
-      return injectCitations(child, citations);
+      return injectCitations(child, citations, onFileClick);
     }
     if (React.isValidElement(child) && child.props?.children) {
       return React.cloneElement(child, {
         ...child.props,
-        children: processChildren(child.props.children, citations),
+        children: processChildren(child.props.children, citations, onFileClick),
       } as any);
     }
     return child;
@@ -136,7 +166,7 @@ function processChildren(
 
 const CITATION_PATTERN = /(\[\*{0,2}\d+\*{0,2}\]|\[[\u2070\u00b9\u00b2\u00b3\u2074-\u2079][,\s\u2070\u00b9\u00b2\u00b3\u2074-\u2079]*\]|[\u2070\u00b9\u00b2\u00b3\u2074-\u2079]+)/g;
 
-function injectCitations(text: string, citations: Citation[]): React.ReactNode[] {
+function injectCitations(text: string, citations: Citation[], onFileClick?: (fileName: string, fileId?: string, excerpt?: string) => void): React.ReactNode[] {
   const parts = text.split(CITATION_PATTERN);
   if (parts.length === 1) return [text];
 
@@ -145,7 +175,7 @@ function injectCitations(text: string, citations: Citation[]): React.ReactNode[]
     if (bracketMatch) {
       const idx = parseInt(bracketMatch[1], 10);
       const citation = citations.find((c) => c.index === idx);
-      if (citation) return <CitationPopover key={`cite-${idx}-${i}`} citation={citation} />;
+      if (citation) return <CitationPopover key={`cite-${idx}-${i}`} citation={citation} onFileClick={onFileClick} />;
     }
 
     const superscriptChars = part.replace(/[\[\],\s]/g, "");
@@ -158,9 +188,9 @@ function injectCitations(text: string, citations: Citation[]): React.ReactNode[]
         const idx = superscriptToNumber(trimmed);
         const citation = citations.find((c) => c.index === idx || c.index === idx + 99);
         if (citation) {
-          elements.push(<CitationPopover key={`cite-s-${idx}-${i}-${j}`} citation={{ ...citation, index: idx }} />);
+          elements.push(<CitationPopover key={`cite-s-${idx}-${i}-${j}`} citation={{ ...citation, index: idx }} onFileClick={onFileClick} />);
         } else {
-          elements.push(<CitationPopover key={`cite-s-${idx}-${i}-${j}`} citation={{ index: idx, source: `Source ${idx}`, excerpt: "" }} />);
+          elements.push(<CitationPopover key={`cite-s-${idx}-${i}-${j}`} citation={{ index: idx, source: `Source ${idx}`, excerpt: "" }} onFileClick={onFileClick} />);
         }
       });
       if (elements.length > 0) return <>{elements}</>;
@@ -184,30 +214,46 @@ function stripCitationsBlock(content: string): string {
     .trim();
 }
 
-function detectDocument(content: string): { title: string } | null {
-  if (content.includes("<!-- SHEET:")) return null;
-  const headingMatch = content.match(/^#\s+(.+)/m) || content.match(/^##\s+(.+)/m);
-  if (headingMatch && content.length > 500) return { title: headingMatch[1] };
+function detectDocuments(content: string): { title: string; content: string }[] {
+  if (content.includes("<!-- SHEET:") || content.includes("<!-- REDFLAGS:")) return [];
+  // Find all top-level headings that could be documents
+  const docs: { title: string; content: string }[] = [];
+  const headingRegex = /^#{1,2}\s+(.+)/gm;
+  let match;
+  const headings: { title: string; index: number }[] = [];
+  while ((match = headingRegex.exec(content)) !== null) {
+    headings.push({ title: match[1], index: match.index });
+  }
+  
+  if (headings.length === 0) {
+    // Try bold title pattern
+    const boldMatch = content.match(/^\*\*([A-Z][A-Z\s\-–—,]+[A-Z])\*\*/m);
+    if (boldMatch && content.length > 500) return [{ title: boldMatch[1], content }];
+    return [];
+  }
 
-  const boldMatch = content.match(/^\*\*([A-Z][A-Z\s\-–—,]+[A-Z])\*\*/m);
-  if (boldMatch && content.length > 500) return { title: boldMatch[1] };
+  if (content.length < 500) return [];
 
-  return null;
+  // Single doc: first heading is the title
+  docs.push({ title: headings[0].title, content });
+  return docs;
 }
 
-function detectSheet(content: string): SheetData | null {
-  const match = content.match(/<!--\s*SHEET:\s*(.+?)\s*-->\s*```json\s*([\s\S]*?)```/);
-  if (!match) return null;
-  try {
-    const parsed = JSON.parse(match[2]);
-    return {
-      title: match[1].trim(),
-      columns: parsed.columns || [],
-      rows: parsed.rows || [],
-    };
-  } catch {
-    return null;
+function detectSheets(content: string): SheetData[] {
+  const sheets: SheetData[] = [];
+  const regex = /<!--\s*SHEET:\s*(.+?)\s*-->\s*```json\s*([\s\S]*?)```/g;
+  let match;
+  while ((match = regex.exec(content)) !== null) {
+    try {
+      const parsed = JSON.parse(match[2]);
+      sheets.push({
+        title: match[1].trim(),
+        columns: parsed.columns || [],
+        rows: parsed.rows || [],
+      });
+    } catch { /* skip invalid */ }
   }
+  return sheets;
 }
 /** Collapsible References section */
 function CollapsibleReferences({ citations, onFileClick }: { citations: Citation[]; onFileClick?: (fileName: string, fileId?: string, excerpt?: string) => void }) {
@@ -308,6 +354,7 @@ export function MessageBubble({
   isStreamingSteps,
   searchSources,
   onFollowUp,
+  onEditMessage,
   plan,
   thinkingText,
   fileRefs,
@@ -321,10 +368,14 @@ export function MessageBubble({
   planUpdateReason,
   progress,
   onFileClick,
+  onRedFlagOpen,
+  onFlagClick,
 }: MessageBubbleProps) {
   const isUser = message.role === "user";
   const citations = message.citations || [];
   const followUps = message.followUps || [];
+  const [isEditing, setIsEditing] = useState(false);
+  const [editText, setEditText] = useState(message.content);
 
   // Client-side follow-up extraction fallback
   let rawContent = message.content;
@@ -348,7 +399,14 @@ export function MessageBubble({
   }
 
   // Preprocess: ensure blank lines around pipe tables for remark-gfm
-  const preprocessed = !isUser ? rawContent.replace(/([^\n])\n(\|)/g, '$1\n\n$2').replace(/(\|)\n([^\n|])/g, '$1\n\n$2') : rawContent;
+  const preprocessed = !isUser ? rawContent
+    // Ensure blank line before table start (line starting with |)
+    .replace(/([^\n])\n(\|[^\n]*\|)/g, '$1\n\n$2')
+    // Ensure blank line after table end (| line followed by non-| non-empty line)
+    .replace(/(\|[^\n]*\|)\n([^\n|])/g, '$1\n\n$2')
+    // Also handle case where table is right after a heading or paragraph with no gap
+    .replace(/(^|\n)([^\n|]+)\n(\|[^\n]*\|[^\n]*\n\|[-:| ]+\|)/gm, '$1$2\n\n$3')
+    : rawContent;
   const cleanContent = !isUser ? stripCitationsBlock(preprocessed) : preprocessed;
 
   const alreadySelected = nextMessage?.role === "user" ? nextMessage.content : null;
@@ -363,15 +421,36 @@ export function MessageBubble({
 
   const isInteractive = isLastAssistant && !alreadySelected;
 
-  const docInfo = !isUser && !isStreaming ? detectDocument(cleanContent) : null;
-  const sheetInfo = !isUser && !isStreaming ? detectSheet(cleanContent) : null;
+  // During streaming, detect markers early to show skeleton
+  // Also detect document drafting patterns during streaming: long content starting with headings
+  const isStreamingDraftContent = isStreaming && !isUser && cleanContent.length > 200 && /^#\s+.+/m.test(cleanContent) && !cleanContent.includes("<!-- SHEET:") && !cleanContent.includes("<!-- REDFLAGS:");
+  const isStreamingSpecialContent = isStreaming && !isUser && (
+    cleanContent.includes("<!-- SHEET:") || cleanContent.includes("<!-- REDFLAGS:") || isStreamingDraftContent
+  );
+
+  const detectedDocs = !isUser && !isStreaming ? detectDocuments(cleanContent) : [];
+  const detectedSheets = !isUser && !isStreaming ? detectSheets(cleanContent) : [];
+  const redFlagData = !isUser && !isStreaming ? parseRedFlags(cleanContent) : null;
+  const docInfo = detectedDocs.length > 0 ? detectedDocs[0] : null;
+  const sheetInfo = detectedSheets.length > 0 ? detectedSheets[0] : null;
+
+  // Separate Drafting Notes from document content
+  let docContentForEditor = docInfo ? cleanContent : "";
+  let draftingNotes = "";
+  if (docInfo) {
+    const notesMatch = cleanContent.match(/\n##\s*Drafting Notes[\s\S]*$/i);
+    if (notesMatch) {
+      docContentForEditor = cleanContent.slice(0, notesMatch.index).trim();
+      draftingNotes = notesMatch[0].trim();
+    }
+  }
 
   const citeComponents = React.useMemo(() => {
     if (!citations.length) return {};
 
     const wrap = (tag: string, className: string) => {
       const Comp = ({ children }: { children?: React.ReactNode }) => {
-        const processed = processChildren(children, citations);
+        const processed = processChildren(children, citations, onFileClick);
         return React.createElement(tag, { className }, processed);
       };
       return Comp;
@@ -380,7 +459,7 @@ export function MessageBubble({
     return {
       p: wrap("p", "text-sm text-foreground/90 my-1.5 leading-relaxed"),
       li: ({ children }: { children?: React.ReactNode }) => (
-        <li>{processChildren(children, citations)}</li>
+        <li>{processChildren(children, citations, onFileClick)}</li>
       ),
       td: wrap("td", "px-3 py-2 border-b border-border text-xs whitespace-normal break-words"),
       th: wrap("th", "bg-muted/50 px-3 py-2 text-left font-medium text-foreground border-b border-border text-xs"),
@@ -392,11 +471,11 @@ export function MessageBubble({
       h6: wrap("h6", "text-xs font-medium text-muted-foreground mt-1.5 mb-0.5"),
       blockquote: ({ children }: { children?: React.ReactNode }) => (
         <blockquote className="border-l-2 border-primary/30 pl-3 my-2 text-muted-foreground italic">
-          {processChildren(children, citations)}
+          {processChildren(children, citations, onFileClick)}
         </blockquote>
       ),
     };
-  }, [citations]);
+  }, [citations, onFileClick]);
 
   // Steps section (with reasoning, plan, thinking, file refs, sources)
   const stepsSection = !isUser && (steps?.length || message.reasoning || plan?.length || thinkingText) ? (
@@ -461,7 +540,7 @@ export function MessageBubble({
           ),
           td: ({ children }) => (
             <td className="px-3 py-2 border-b border-border text-xs whitespace-normal break-words align-top">
-              {citations.length > 0 ? processChildren(children, citations) : children}
+              {citations.length > 0 ? processChildren(children, citations, onFileClick) : children}
             </td>
           ),
           th: ({ children }) => (
@@ -503,6 +582,74 @@ export function MessageBubble({
       </ReactMarkdown>
     </div>
   );
+
+  // Render red flags
+  if (redFlagData) {
+    // Strip the REDFLAGS block from content for any remaining text display
+    const remainingContent = cleanContent.replace(/<!--\s*REDFLAGS:\s*.+?\s*-->\s*```json\s*[\s\S]*?```/, "").trim();
+    return (
+      <div className="group">
+        <div className="flex items-center gap-2 mb-2">
+          <AgentAvatar isUser={false} />
+          <span className="text-xs font-semibold text-foreground">LawKit AI</span>
+        </div>
+        <div className="pl-8 space-y-3">
+          {stepsSection}
+          {remainingContent && (
+            <div className="text-sm text-foreground/90 leading-relaxed prose prose-sm max-w-none">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{remainingContent.replace(/<!--\s*REDFLAGS:[\s\S]*?```/, "").trim()}</ReactMarkdown>
+            </div>
+          )}
+          <RedFlagCard
+            data={redFlagData}
+            onOpenInEditor={() => {
+              if (onRedFlagOpen) {
+                const meta = (message as any).metadata || {};
+                const redFlagTarget = meta.redFlagTarget;
+                // Priority: 1) redFlagTarget from metadata, 2) title match in refs, 3) attachments
+                if (redFlagTarget?.id) {
+                  onRedFlagOpen(redFlagData, redFlagTarget.name || redFlagData.title || "document", redFlagTarget.id);
+                } else {
+                  const refs = (message as any).frozenFileRefs || fileRefs;
+                  const titleMatch = refs?.find((r: any) => redFlagData.title?.toLowerCase().includes(r.name?.toLowerCase()?.replace(/\.[^.]+$/, "")));
+                  const bestRef = titleMatch || refs?.[0];
+                  const userAttachments = (message as any).attachments;
+                  const fallbackName = bestRef?.name || userAttachments?.fileNames?.[0] || redFlagData.title || "document";
+                  const fallbackId = bestRef?.id || userAttachments?.fileIds?.[0];
+                  onRedFlagOpen(redFlagData, fallbackName, fallbackId);
+                }
+              }
+            }}
+            onFlagClick={(index) => {
+              if (onRedFlagOpen) {
+                const meta = (message as any).metadata || {};
+                const redFlagTarget = meta.redFlagTarget;
+                if (redFlagTarget?.id) {
+                  onRedFlagOpen(redFlagData, redFlagTarget.name || redFlagData.title || "document", redFlagTarget.id);
+                } else {
+                  const refs = (message as any).frozenFileRefs || fileRefs;
+                  const titleMatch = refs?.find((r: any) => redFlagData.title?.toLowerCase().includes(r.name?.toLowerCase()?.replace(/\.[^.]+$/, "")));
+                  const bestRef = titleMatch || refs?.[0];
+                  const userAttachments = (message as any).attachments;
+                  const fallbackName = bestRef?.name || userAttachments?.fileNames?.[0] || redFlagData.title || "document";
+                  const fallbackId = bestRef?.id || userAttachments?.fileIds?.[0];
+                  onRedFlagOpen(redFlagData, fallbackName, fallbackId);
+                }
+              }
+              onFlagClick?.(index);
+            }}
+          />
+          {!isUser && !isStreaming && citations.length > 0 && (
+            <CollapsibleReferences citations={citations} onFileClick={onFileClick} />
+          )}
+          {followUpSection}
+          {!isStreaming && cleanContent && (
+            <ResponseActions content={cleanContent} messageId={message.id} conversationId={conversationId} onRegenerate={onRegenerate} />
+          )}
+        </div>
+      </div>
+    );
+  }
 
   // Render sheet as compact card
   if (sheetInfo && onSheetOpen) {
@@ -558,7 +705,7 @@ export function MessageBubble({
           })()}
           <Card
             className="cursor-pointer border-border/60 hover:border-primary/40 hover:bg-accent/30 transition-all duration-200 p-0"
-            onClick={() => onDocumentOpen(docInfo.title, cleanContent)}
+            onClick={() => onDocumentOpen(docInfo.title, docContentForEditor)}
           >
             <div className="flex items-center gap-3 p-3">
               <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-primary/10">
@@ -570,6 +717,11 @@ export function MessageBubble({
               </div>
             </div>
           </Card>
+          {draftingNotes && (
+            <div className="text-sm text-foreground/90 leading-relaxed prose prose-sm dark:prose-invert max-w-none">
+              <ReactMarkdown remarkPlugins={[remarkGfm]}>{draftingNotes}</ReactMarkdown>
+            </div>
+          )}
           {followUpSection}
           {!isStreaming && cleanContent && (
              <ResponseActions content={cleanContent} messageId={message.id} conversationId={conversationId} onRegenerate={onRegenerate} />
@@ -658,16 +810,82 @@ export function MessageBubble({
         )}
 
         {isUser ? (
-          <div>
-            <p className="text-sm text-foreground whitespace-pre-wrap">{message.content}</p>
-            <AttachmentBadges attachments={message.attachments} />
-            <UserMessageActions content={message.content} />
+          isEditing ? (
+            <div className="space-y-2">
+              <textarea
+                value={editText}
+                onChange={(e) => setEditText(e.target.value)}
+                className="w-full text-sm text-foreground bg-muted/50 border border-border rounded-md px-3 py-2 resize-none focus:outline-none focus:ring-2 focus:ring-ring min-h-[60px]"
+                rows={3}
+                autoFocus
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && !e.shiftKey) {
+                    e.preventDefault();
+                    if (editText.trim() && onEditMessage) {
+                      onEditMessage(message.id, editText.trim());
+                      setIsEditing(false);
+                    }
+                  }
+                  if (e.key === "Escape") setIsEditing(false);
+                }}
+              />
+              <div className="flex items-center gap-1.5">
+                <Button
+                  size="sm"
+                  className="h-6 text-[10px] px-2.5 gap-1"
+                  onClick={() => {
+                    if (editText.trim() && onEditMessage) {
+                      onEditMessage(message.id, editText.trim());
+                      setIsEditing(false);
+                    }
+                  }}
+                >
+                  <Check className="h-2.5 w-2.5" />
+                  Save & Resend
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  className="h-6 text-[10px] px-2.5 gap-1"
+                  onClick={() => { setIsEditing(false); setEditText(message.content); }}
+                >
+                  <X className="h-2.5 w-2.5" />
+                  Cancel
+                </Button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              <p className="text-sm text-foreground whitespace-pre-wrap">{message.content}</p>
+              <AttachmentBadges attachments={message.attachments} onFileClick={(name) => onFileClick?.(name)} />
+              <UserMessageActions
+                content={message.content}
+                onEdit={onEditMessage ? () => { setEditText(message.content); setIsEditing(true); } : undefined}
+              />
+            </div>
+          )
+        ) : isStreamingSpecialContent ? (
+          <div className="space-y-3">
+            <div className="flex items-center gap-3 p-3 rounded-lg border border-border/60 bg-muted/30">
+              <Loader2 className="h-4 w-4 animate-spin text-primary" />
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-foreground">
+                  {cleanContent.includes("<!-- SHEET:") ? "Generating review table..." : cleanContent.includes("<!-- REDFLAGS:") ? "Analyzing document for red flags..." : "Drafting document..."}
+                </p>
+                <p className="text-xs text-muted-foreground">Results will open in the sidebar</p>
+              </div>
+            </div>
+            <div className="space-y-2 animate-pulse">
+              <div className="h-3.5 bg-muted rounded w-full" />
+              <div className="h-3.5 bg-muted rounded w-5/6" />
+              <div className="h-3.5 bg-muted rounded w-3/4" />
+            </div>
           </div>
         ) : (
           markdownContent
         )}
 
-        {isStreaming && !isUser && cleanContent.length > 0 && (
+        {isStreaming && !isUser && !isStreamingSpecialContent && cleanContent.length > 0 && (
           <div className="space-y-0">
             <span className="inline-block w-0.5 h-4 bg-primary animate-pulse ml-0.5 align-text-bottom rounded-full" />
             {cleanContent.length < 300 && (

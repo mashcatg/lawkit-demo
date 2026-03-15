@@ -26,7 +26,7 @@ interface StepTrackerProps {
   planUpdateReason?: string | null;
   progress?: { current: number; total: number } | null;
   citations?: Citation[];
-  onFileClick?: (fileName: string, fileId?: string) => void;
+  onFileClick?: (fileName: string, fileId?: string, excerpt?: string) => void;
 }
 
 function isPlanStepDone(planStep: string, steps: AgentStep[]): boolean {
@@ -51,7 +51,6 @@ export function StepTracker({
 }: StepTrackerProps) {
   const [expandedSteps, setExpandedSteps] = useState<Set<number>>(new Set());
   const [showAllFileRefs, setShowAllFileRefs] = useState(false);
-  const [collapsed, setCollapsed] = useState(false);
   const [sourcesExpanded, setSourcesExpanded] = useState(false);
 
   const hasSteps = steps.length > 0;
@@ -65,7 +64,17 @@ export function StepTracker({
   const completedCount = steps.filter((s) => s.status === "done").length;
   const totalSteps = hasPlan ? plan.length : steps.length;
 
+  // Collapsed state: derive initial value from whether steps are already done.
+  // This prevents re-mount from resetting collapse state when sidebar opens/closes.
   const hasAutoCollapsedRef = useRef(false);
+  const [collapsed, setCollapsed] = useState(() => {
+    // If on mount all steps are done and we're not streaming, start collapsed
+    if (allDone && hasSteps && !isStreaming) {
+      hasAutoCollapsedRef.current = true;
+      return true;
+    }
+    return false;
+  });
 
   useEffect(() => {
     if (isStreaming) {
@@ -112,7 +121,6 @@ export function StepTracker({
   // Collapsed summary
   if (collapsed && !isWorking) {
     const stepNames = steps.slice(0, 3).map(s => s.name).join(", ");
-    // Sum actual durations from step.duration strings like "72s"
     const totalTime = steps.reduce((sum, s) => {
       if (s.duration) { const num = parseInt(s.duration.replace(/[^\d]/g, '')); return sum + (isNaN(num) ? 0 : num); }
       return sum;
@@ -125,7 +133,7 @@ export function StepTracker({
       >
         <Check className="h-3.5 w-3.5 text-primary shrink-0" />
         <span className="flex-1 truncate">
-          Analyzed in {completedCount} step{completedCount !== 1 ? "s" : ""}
+          Analyzed in {totalSteps} step{totalSteps !== 1 ? "s" : ""}
           {totalTime > 0 && ` · ${totalTime}s`}
           {hasCitations && ` · ${totalCited} sources`}
           {stepNames && <span className="text-muted-foreground/60 ml-1">— {stepNames}</span>}
@@ -150,18 +158,18 @@ export function StepTracker({
           <span className="font-medium text-foreground">
             {isWorking
               ? currentStep?.name || (hasReasoning ? "Thinking..." : "Working...")
-              : `Completed in ${steps.length} steps`}
+              : `Completed in ${totalSteps} steps`}
           </span>
         </div>
         <div className="flex items-center gap-1.5">
-          {progress && isWorking && (
+          {progress && (
             <span className="text-[10px] font-mono text-agent-blue font-medium">
-              {Math.min(progress.current, progress.total)} / {Math.max(progress.current, progress.total)}
+              {isWorking ? `${Math.min(progress.current, progress.total)} / ${progress.total}` : `${progress.total} / ${progress.total}`}
             </span>
           )}
           {!progress && totalSteps > 0 && (
             <Badge variant="outline" className="text-[9px] py-0 px-1.5 font-mono">
-              {completedCount} / {totalSteps}
+              {isWorking ? completedCount : totalSteps} / {totalSteps}
             </Badge>
           )}
           {planUpdateReason && (
@@ -402,7 +410,7 @@ export function StepTracker({
         </div>
       )}
 
-      {/* Sources section (moved from SourcesFooter) */}
+      {/* Sources section */}
       {hasCitations && !isStreaming && (
         <div className="mt-1">
           <button
@@ -425,21 +433,27 @@ export function StepTracker({
             <div className="mt-2 flex flex-wrap gap-2">
               {uniqueWebSources.map((c) => {
                 const domain = c.url ? getDomain(c.url) : c.source;
+                const displayTitle = c.title || domain;
                 return (
                   <a
                     key={c.index}
                     href={c.url}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-foreground hover:bg-accent/50 transition-colors"
+                    className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-foreground hover:bg-accent/50 transition-colors max-w-[220px]"
                   >
                     <img
                       src={`https://www.google.com/s2/favicons?domain=${domain}&sz=16`}
                       alt=""
-                      className="h-3.5 w-3.5 rounded-sm"
+                      className="h-3.5 w-3.5 rounded-sm shrink-0"
                       onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
                     />
-                    <span className="truncate max-w-[140px]">{domain}</span>
+                    <div className="flex flex-col min-w-0 flex-1">
+                      <span className="truncate font-medium leading-tight">{displayTitle}</span>
+                      {c.title && (
+                        <span className="truncate text-[10px] text-muted-foreground leading-tight">{domain}</span>
+                      )}
+                    </div>
                     <ExternalLink className="h-2.5 w-2.5 text-muted-foreground shrink-0" />
                   </a>
                 );
@@ -449,7 +463,7 @@ export function StepTracker({
                 return (
                   <button
                     key={c.index}
-                    onClick={() => onFileClick?.(displayName)}
+                    onClick={() => onFileClick?.(displayName, undefined, c.excerpt)}
                     className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-foreground hover:bg-accent/50 transition-colors cursor-pointer"
                   >
                     <FileText className="h-3.5 w-3.5 text-primary shrink-0" />

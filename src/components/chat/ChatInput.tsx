@@ -1,5 +1,5 @@
 import { useState, useRef, useEffect } from "react";
-import { Sparkles, Send, Plus, Loader2, MessageSquare, FileText, AlertTriangle, ChevronDown, FolderOpen, Scale, Table2, Zap, Reply, X, Upload, BookOpen, Globe } from "lucide-react";
+import { Sparkles, Send, Plus, Loader2, MessageSquare, FileText, AlertTriangle, ChevronDown, FolderOpen, Scale, Table2, Zap, Reply, X, Upload, BookOpen, Globe, ExternalLink } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { Textarea } from "@/components/ui/textarea";
 import { Switch } from "@/components/ui/switch";
@@ -81,6 +81,7 @@ interface ChatInputProps {
   onFileSelect?: () => void;
   onRemoveFile?: (index: number) => void;
   isProcessingFiles?: boolean;
+  onFilesDropped?: (files: File[]) => void;
   // Knowledge base
   kbSources?: KBSource[];
 }
@@ -89,7 +90,7 @@ export function ChatInput({
   value, onChange, onSend, disabled, deepResearch = false, onDeepResearchChange,
   promptMode, onPromptModeChange, vaults, selectedVault, onVaultSelect, activeSources, onSourceToggle,
   workflowTag, onWorkflowTagRemove, replyContext, onRemoveReply,
-  attachedFiles, onFileSelect, onRemoveFile, isProcessingFiles, kbSources,
+  attachedFiles, onFileSelect, onRemoveFile, isProcessingFiles, kbSources, onFilesDropped,
 }: ChatInputProps) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const { profile } = useAuth();
@@ -231,17 +232,8 @@ export function ChatInput({
         e.preventDefault();
         setIsDraggingOver(false);
         const files = Array.from(e.dataTransfer.files);
-        if (files.length && onFileSelect) {
-          // Trigger file processing via the parent's hidden input approach
-          // We dispatch a custom event or call onFileSelect directly
-          const dataTransfer = new DataTransfer();
-          files.forEach(f => dataTransfer.items.add(f));
-          // Find the hidden file input and set its files
-          const fileInput = e.currentTarget.closest('.mx-auto')?.querySelector('input[type="file"]') as HTMLInputElement;
-          if (fileInput) {
-            fileInput.files = dataTransfer.files;
-            fileInput.dispatchEvent(new Event('change', { bubbles: true }));
-          }
+        if (files.length && onFilesDropped) {
+          onFilesDropped(files);
         }
       }}
     >
@@ -376,26 +368,41 @@ export function ChatInput({
                   </>
                 )}
 
+                {/* Google Drive */}
+                <button
+                  onClick={() => {
+                    toast({ title: "Google Drive", description: "Google Drive integration coming soon — connect your Google account in Settings." });
+                  }}
+                  className="flex w-full items-center gap-2.5 rounded-md px-2.5 py-2 text-xs text-foreground hover:bg-muted transition-colors"
+                >
+                  <ExternalLink className="h-3.5 w-3.5 text-muted-foreground" />
+                  Google Drive
+                  <Badge variant="outline" className="text-[8px] py-0 px-1 ml-auto">Soon</Badge>
+                </button>
+                <div className="my-1 h-px bg-border" />
+
                 {effectiveVaults.length > 0 && (
                   <>
                     <p className="text-[10px] font-medium text-muted-foreground px-2.5 py-1 uppercase tracking-wider">
                       Vaults
                     </p>
-                    {effectiveVaults.map((v) => (
-                      <button
-                        key={v.id}
-                        onClick={() => onVaultSelect?.(selectedVault?.id === v.id ? null : v)}
-                        className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-xs text-foreground hover:bg-muted transition-colors"
-                      >
-                        <span className="flex items-center gap-2.5">
-                          <FolderOpen className="h-3.5 w-3.5 text-muted-foreground" />
-                          {v.name}
-                        </span>
-                        {selectedVault?.id === v.id && (
-                          <span className="h-1.5 w-1.5 rounded-full bg-primary" />
-                        )}
-                      </button>
-                    ))}
+                    <div className="max-h-[140px] overflow-y-auto">
+                      {effectiveVaults.map((v) => (
+                        <button
+                          key={v.id}
+                          onClick={() => onVaultSelect?.(selectedVault?.id === v.id ? null : v)}
+                          className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-xs text-foreground hover:bg-muted transition-colors"
+                        >
+                          <span className="flex items-center gap-2.5 truncate">
+                            <FolderOpen className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                            <span className="truncate">{v.name}</span>
+                          </span>
+                          {selectedVault?.id === v.id && (
+                            <span className="h-1.5 w-1.5 rounded-full bg-primary shrink-0" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
                     <div className="my-1 h-px bg-border" />
                   </>
                 )}
@@ -405,21 +412,23 @@ export function ChatInput({
                     <p className="text-[10px] font-medium text-muted-foreground px-2.5 py-1 uppercase tracking-wider">
                       Knowledge Base
                     </p>
-                    {effectiveKb.map((kb) => (
-                      <button
-                        key={kb.id}
-                        onClick={() => onSourceToggle?.(kb.title)}
-                        className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-xs text-foreground hover:bg-muted transition-colors"
-                      >
-                        <span className="flex items-center gap-2.5">
-                          <BookOpen className="h-3.5 w-3.5 text-muted-foreground" />
-                          {kb.title}
-                        </span>
-                        {activeSources?.includes(kb.title) && (
-                          <span className="h-1.5 w-1.5 rounded-full bg-primary" />
-                        )}
-                      </button>
-                    ))}
+                    <div className="max-h-[120px] overflow-y-auto">
+                      {effectiveKb.map((kb) => (
+                        <button
+                          key={kb.id}
+                          onClick={() => onSourceToggle?.(kb.title)}
+                          className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-xs text-foreground hover:bg-muted transition-colors"
+                        >
+                          <span className="flex items-center gap-2.5 truncate">
+                            <BookOpen className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                            <span className="truncate">{kb.title}</span>
+                          </span>
+                          {activeSources?.includes(kb.title) && (
+                            <span className="h-1.5 w-1.5 rounded-full bg-primary shrink-0" />
+                          )}
+                        </button>
+                      ))}
+                    </div>
                     <div className="my-1 h-px bg-border" />
                   </>
                 )}
@@ -436,21 +445,23 @@ export function ChatInput({
                     className="w-full h-7 px-2 text-xs rounded border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-ring"
                   />
                 </div>
-                {filteredJurisdictions.map((j) => (
-                  <button
-                    key={j.name}
-                    onClick={() => onSourceToggle?.(j.name)}
-                    className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-xs text-foreground hover:bg-muted transition-colors"
-                  >
-                    <span className="flex items-center gap-2.5">
-                      <j.icon className="h-3.5 w-3.5 text-muted-foreground" />
-                      {j.name}
-                    </span>
-                    {activeSources?.includes(j.name) && (
-                      <span className="h-1.5 w-1.5 rounded-full bg-primary" />
-                    )}
-                  </button>
-                ))}
+                <div className="max-h-[200px] overflow-y-auto">
+                  {filteredJurisdictions.map((j) => (
+                    <button
+                      key={j.name}
+                      onClick={() => onSourceToggle?.(j.name)}
+                      className="flex w-full items-center justify-between rounded-md px-2.5 py-1.5 text-xs text-foreground hover:bg-muted transition-colors"
+                    >
+                      <span className="flex items-center gap-2.5 truncate">
+                        <j.icon className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                        <span className="truncate">{j.name}</span>
+                      </span>
+                      {activeSources?.includes(j.name) && (
+                        <span className="h-1.5 w-1.5 rounded-full bg-primary shrink-0" />
+                      )}
+                    </button>
+                  ))}
+                </div>
               </div>
             </ScrollArea>
           </PopoverContent>

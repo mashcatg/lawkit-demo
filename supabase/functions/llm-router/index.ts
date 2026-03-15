@@ -5,16 +5,28 @@ import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 // Server-side AES-GCM decryption
 // ──────────────────────────────────────────────
 async function decryptApiKey(encryptedHex: string, ivHex: string): Promise<string> {
-  const secret = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
-  const keyMaterial = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "PBKDF2" }, false, ["deriveKey"]);
-  const key = await crypto.subtle.deriveKey(
-    { name: "PBKDF2", salt: new TextEncoder().encode("lawkit-api-key-enc"), iterations: 100000, hash: "SHA-256" },
-    keyMaterial, { name: "AES-GCM", length: 256 }, false, ["decrypt"]
-  );
-  const encrypted = new Uint8Array(encryptedHex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
-  const iv = new Uint8Array(ivHex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
-  const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, key, encrypted);
-  return new TextDecoder().decode(decrypted);
+  // Guard: skip decryption if inputs are missing or invalid
+  if (!encryptedHex || !ivHex || ivHex.length < 2) return "";
+  try {
+    const ivBytes = new Uint8Array(ivHex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
+    // AES-GCM requires IV of 12 or 16 bytes
+    if (ivBytes.length !== 12 && ivBytes.length !== 16) {
+      console.error(`Invalid IV length: ${ivBytes.length} (expected 12 or 16)`);
+      return "";
+    }
+    const secret = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+    const keyMaterial = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "PBKDF2" }, false, ["deriveKey"]);
+    const key = await crypto.subtle.deriveKey(
+      { name: "PBKDF2", salt: new TextEncoder().encode("lawkit-api-key-enc"), iterations: 100000, hash: "SHA-256" },
+      keyMaterial, { name: "AES-GCM", length: 256 }, false, ["decrypt"]
+    );
+    const encrypted = new Uint8Array(encryptedHex.match(/.{1,2}/g)!.map(b => parseInt(b, 16)));
+    const decrypted = await crypto.subtle.decrypt({ name: "AES-GCM", iv: ivBytes }, key, encrypted);
+    return new TextDecoder().decode(decrypted);
+  } catch (e) {
+    console.error("decryptApiKey failed:", e);
+    return "";
+  }
 }
 
 const corsHeaders = {
@@ -81,6 +93,9 @@ function assessComplexity(query: string, context: { jurisdictions?: string[]; ha
   if (/multi.?jurisdict|cross.?border|international/i.test(query)) score += 2;
   if (/what is|define|meaning of|explain briefly/i.test(query)) score -= 2;
   if (/deep research|comprehensive|exhaustive|thorough analysis/i.test(query)) score += 3;
+  // Floor at sonar-pro for any jurisdiction/legal query
+  if (/jurisdiction|statute|case law|precedent|v\.\s|non-?compete|restraint of trade|confidential|fiduciary|negligence|tort|contract law|common law/i.test(query)) score = Math.max(score, 3);
+  if (context.jurisdictions && context.jurisdictions.length >= 1) score = Math.max(score, 3);
   return Math.max(0, Math.min(10, score));
 }
 
@@ -89,6 +104,31 @@ function selectPerplexityModel(score: number, deepResearch: boolean): { model: s
   if (score >= 6) return { model: "sonar-deep-research" };
   if (score >= 3) return { model: "sonar-pro" };
   return { model: "sonar" };
+}
+
+// ──────────────────────────────────────────────
+// Request Type Classification (hard-coded routing)
+// ──────────────────────────────────────────────
+function classifyRequestType(message: string, hasAttachedFiles: boolean, hasVault: boolean, conversationHistory: any[], sources?: string[]): 1 | 2 | 3 | 4 | 5 | 6 {
+  // TYPE 3 — Document task (file attached or explicit doc reference)
+  if (hasAttachedFiles) return 3;
+  if (/this document|the uploaded|these contracts|attached file|this NDA|this contract|this agreement/i.test(message)) return 3;
+  
+  // TYPE 5 — EDGAR/SEC lookup
+  if (/\b(SEC|EDGAR|10-K|10-Q|8-K|S-1|proxy\s*statement|annual\s*report|quarterly\s*filing)\b/i.test(message) || sources?.includes("EDGAR (SEC)")) return 5;
+  
+  // TYPE 6 — EUR-Lex lookup
+  if (/\b(EUR-Lex|EU\s*regulation|EU\s*directive|GDPR|MiFID|AIFMD|european\s*court|CJEU|ECJ)\b/i.test(message) || sources?.includes("EUR-Lex")) return 6;
+  
+  // TYPE 2 — Case/research lookup (including CourtListener)
+  if (/v\.\s|vs?\.\s|court|appeal|ruling|judgment|citation|\d+\s+(So|F|U\.S|S\.Ct)|case\s+(no|number|#)/i.test(message)) return 2;
+  if (sources?.includes("CourtListener")) return 2;
+  
+  // TYPE 4 — Vault task
+  if (/\b(our|my vault|saved|previous|from\s+(?:the\s+)?vault)\b/i.test(message)) return 4;
+  
+  // TYPE 1 — Factual/legal question (default)
+  return 1;
 }
 
 // ──────────────────────────────────────────────
@@ -118,6 +158,107 @@ function prefixSearchQuery(query: string, jurisdictions: string[]): string {
   return prefix ? `${prefix} ${query}` : query;
 }
 
+// ──────────────────────────────────────────────
+// Query Decomposition — Multi-Query Search
+// ──────────────────────────────────────────────
+function decomposeSearchQueries(
+  message: string,
+  tool: string,
+  jurisdictions: string[],
+  requestType: number
+): string[] {
+  // Strip meta-instructions that pollute search queries
+  let cleaned = message
+    .replace(/\b(search|find|look up|research|cite|analyze|explain|summarize|compare|deep research|give me)\b:?\s*/gi, "")
+    .replace(/\b(using|via|from|through|in)\s+(courtlistener|edgar|eur-lex|sec|european)\s*/gi, "")
+    .replace(/\b(please|can you|could you|I need|I want)\b\s*/gi, "")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!cleaned || cleaned.length < 5) cleaned = message;
+
+  const queries: string[] = [];
+
+  switch (tool) {
+    case "courtlistener": {
+      // Extract case names (Party v Party patterns)
+      const caseNames = message.match(/[A-Z][a-z]+(?:\s[A-Z][a-z]+)*\s+v\.?\s+[A-Z][a-z]+(?:\s[A-Z][a-z]+)*/g);
+      if (caseNames) {
+        caseNames.forEach(cn => queries.push(cn));
+      }
+      // Extract legal doctrines/concepts
+      const doctrines = cleaned.replace(/[A-Z][a-z]+\s+v\.?\s+[A-Z][a-z]+(?:\s[A-Z][a-z]+)*/g, "").trim();
+      if (doctrines.length > 10) {
+        queries.push(doctrines);
+      }
+      // Add jurisdiction-focused variant
+      if (jurisdictions.length > 0 && queries.length > 0) {
+        queries.push(`${jurisdictions[0]} ${queries[0]}`);
+      }
+      break;
+    }
+    case "edgar": {
+      // Extract company names
+      const companies = cleaned.match(/\b(Apple|Microsoft|Tesla|Google|Alphabet|Amazon|Meta|Facebook|Nvidia|JPMorgan|Goldman\s*Sachs)\b/gi);
+      const formTypes = cleaned.match(/\b(10-K|10-Q|8-K|S-1|DEF\s*14A|20-F|6-K|proxy\s*statement|annual\s*report)\b/gi);
+      if (companies) {
+        companies.forEach(co => {
+          const form = formTypes?.[0] || "";
+          queries.push(`${co} ${form}`.trim());
+        });
+      }
+      // Date-specific variant
+      const yearMatch = cleaned.match(/\b(20\d{2})\b/);
+      if (yearMatch && queries.length > 0) {
+        queries.push(`${queries[0]} ${yearMatch[1]}`);
+      }
+      if (queries.length === 0) queries.push(cleaned);
+      break;
+    }
+    case "eurlex": {
+      // CELEX-first: check for known regulation references
+      const knownTerms = ["gdpr", "ai act", "mifid", "dora", "dsa", "dma", "nis2", "digital services", "digital markets", "trade secrets", "ecommerce"];
+      const foundTerms = knownTerms.filter(t => cleaned.toLowerCase().includes(t));
+      foundTerms.forEach(t => queries.push(t));
+      // Legal concept fallback
+      const conceptQuery = cleaned.replace(/\b(EU|european|regulation|directive|article)\b/gi, "").trim();
+      if (conceptQuery.length > 8 && !foundTerms.length) {
+        queries.push(`EU ${conceptQuery}`);
+      }
+      // Article-specific query
+      const articleMatch = cleaned.match(/article\s+(\d+)/i);
+      if (articleMatch && foundTerms.length > 0) {
+        queries.push(`${foundTerms[0]} article ${articleMatch[1]}`);
+      }
+      if (queries.length === 0) queries.push(cleaned);
+      break;
+    }
+    case "web_search": {
+      // Generate 2-3 angle queries
+      queries.push(cleaned);
+      // Jurisdiction-specific angle
+      if (jurisdictions.length > 0) {
+        queries.push(`${jurisdictions[0]} law ${cleaned}`);
+      }
+      // If complex query, add a focused sub-query
+      if (cleaned.split(/\s+/).length > 8) {
+        // Extract the core legal question (first sentence or clause)
+        const firstSentence = cleaned.split(/[.?!]/)[0]?.trim();
+        if (firstSentence && firstSentence !== cleaned) {
+          queries.push(firstSentence);
+        }
+      }
+      break;
+    }
+    default:
+      queries.push(cleaned);
+  }
+
+  // Deduplicate and limit to 4 queries
+  const unique = [...new Set(queries.map(q => q.trim()).filter(q => q.length > 3))];
+  return unique.slice(0, 4);
+}
+
 const SOURCE_DOMAIN_MAP: Record<string, string[]> = {
   "EDGAR (SEC)": ["sec.gov", "edgar.sec.gov"],
   "CourtListener": ["courtlistener.com"],
@@ -142,6 +283,288 @@ const PPLX_SYSTEM: Record<string, string> = {
   "sonar-pro": "You are a senior legal research specialist. Provide thorough, multi-source legal analysis with comprehensive citations.",
   "sonar-deep-research": "You are a senior legal researcher conducting comprehensive multi-source analysis. Analyze multiple jurisdictions and provide exhaustive citations.",
 };
+
+// ──────────────────────────────────────────────
+// Tool: CourtListener Search
+// ──────────────────────────────────────────────
+async function toolCourtListener(query: string, apiKey: string): Promise<ToolResult> {
+  const headers: Record<string, string> = { Accept: "application/json" };
+  if (apiKey) headers["Authorization"] = `Token ${apiKey}`;
+  const url = `https://www.courtlistener.com/api/rest/v3/search/?q=${encodeURIComponent(query)}&type=o&format=json`;
+  const resp = await fetch(url, { headers });
+  if (!resp.ok) {
+    return { context: "", citations: [], domains: ["courtlistener.com"], fileRefs: [], summary: `CourtListener error: ${resp.status}` };
+  }
+  const data = await resp.json();
+  const results = (data.results || []).slice(0, 8);
+  if (!results.length) {
+    return { context: "No CourtListener results found.", citations: [], domains: ["courtlistener.com"], fileRefs: [], summary: "0 results" };
+  }
+  const citations = results.map((r: any, i: number) => ({
+    index: i + 1,
+    source: r.caseName || r.case_name || "Court Opinion",
+    excerpt: (r.snippet || r.text || "").substring(0, 300),
+    url: r.absolute_url ? `https://www.courtlistener.com${r.absolute_url}` : undefined,
+  }));
+  const context = results.map((r: any) => {
+    const name = r.caseName || r.case_name || "Unknown";
+    const court = r.court || "";
+    const date = r.dateFiled || r.date_filed || "";
+    const text = (r.snippet || r.text || "").substring(0, 500);
+    return `## ${name}\nCourt: ${court} | Date: ${date}\n${text}`;
+  }).join("\n\n");
+  return { context, citations, domains: ["courtlistener.com"], fileRefs: [], summary: `${results.length} cases found` };
+}
+
+// ──────────────────────────────────────────────
+// Tool: EDGAR (SEC) Search
+// ──────────────────────────────────────────────
+async function toolEdgar(query: string, userAgent: string): Promise<ToolResult> {
+  const ua = userAgent || "LawKit/1.0 contact@lawkit.ai";
+  const headers: Record<string, string> = { "User-Agent": ua, Accept: "application/json" };
+
+  // Known CIK mapping for common companies
+  const CIK_MAP: Record<string, string> = {
+    apple: "0000320193", microsoft: "0000789019", tesla: "0001318605",
+    google: "0001652044", alphabet: "0001652044", amazon: "0001018724",
+    meta: "0001326801", facebook: "0001326801", nvidia: "0001045810",
+    jpmorgan: "0000019617", "goldman sachs": "0000886982",
+  };
+
+  // Extract form type from query
+  const formMatch = query.match(/\b(10-K|10-Q|8-K|S-1|DEF\s*14A|20-F|6-K|proxy\s*statement)\b/i);
+  const formType = formMatch ? formMatch[1].replace(/\s+/g, " ").toUpperCase().replace("PROXY STATEMENT", "DEF 14A") : "";
+
+  // Try EDGAR EFTS full-text search API
+  const eftsBase = "https://efts.sec.gov/LATEST/search-index";
+  const formParam = formType ? `&forms=${encodeURIComponent(formType)}` : "&forms=10-K,10-Q,8-K,S-1,DEF+14A";
+  const endpoints = [
+    `${eftsBase}?q=${encodeURIComponent(query)}&dateRange=custom&startdt=2020-01-01${formParam}`,
+    `${eftsBase}?q=${encodeURIComponent(query)}`,
+  ];
+
+  for (const url of endpoints) {
+    try {
+      const resp = await fetch(url, { headers });
+      if (!resp.ok) { console.error(`EDGAR EFTS ${resp.status} for ${url}`); continue; }
+      const data = await resp.json();
+      const hits = (data.hits?.hits || data.filings || []).slice(0, 10);
+      if (!hits.length) continue;
+
+      const parsed = hits.map((h: any) => {
+        const s = h._source || h;
+        return {
+          company: s.entity_name || s.display_names?.[0] || s.company_name || "Unknown",
+          form_type: s.file_type || s.form_type || "Filing",
+          filed_date: s.file_date || s.date_filed || "N/A",
+          period: s.period_of_report || "",
+          cik: s.entity_id || s.cik || "N/A",
+          description: s.file_description || s.description || "",
+          url: s.file_num
+            ? `https://www.sec.gov/Archives/edgar/data/${s.entity_id}/${s.file_num.replace(/-/g, "")}`
+            : (h.filing_href || `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${s.entity_id || s.cik}&type=${s.file_type || ""}&dateb=&owner=include&count=10`),
+        };
+      });
+
+      const contextLines = parsed.map((p: any, i: number) =>
+        `Filing ${i + 1}: ${p.company} — ${p.form_type} filed ${p.filed_date}${p.period ? ` (period: ${p.period})` : ""}. CIK: ${p.cik}. ${p.description}`
+      );
+      const context = `EDGAR returned ${parsed.length} filings.\n\n${contextLines.join("\n\n")}`;
+      const citations = parsed.map((p: any, i: number) => ({
+        index: i + 1,
+        source: `${p.company} — ${p.form_type}`,
+        excerpt: `Filed: ${p.filed_date}. ${p.description}`.substring(0, 200),
+        url: p.url,
+      }));
+      return { context, citations, domains: ["sec.gov"], fileRefs: [], summary: `${parsed.length} filings found` };
+    } catch (e) {
+      console.error("EDGAR endpoint failed:", url, e);
+      continue;
+    }
+  }
+
+  // Fallback: Try CIK-based lookup for known companies
+  const queryLower = query.toLowerCase();
+  for (const [name, cik] of Object.entries(CIK_MAP)) {
+    if (queryLower.includes(name)) {
+      try {
+        const subUrl = `https://data.sec.gov/submissions/CIK${cik}.json`;
+        const subResp = await fetch(subUrl, { headers: { "User-Agent": ua, Accept: "application/json" } });
+        if (subResp.ok) {
+          const subData = await subResp.json();
+          const recent = subData.filings?.recent;
+          if (recent?.form) {
+            const filings = [];
+            for (let i = 0; i < Math.min(recent.form.length, 15); i++) {
+              if (formType && recent.form[i] !== formType) continue;
+              filings.push({
+                company: subData.name || name,
+                form_type: recent.form[i],
+                filed_date: recent.filingDate[i],
+                accession: recent.accessionNumber[i],
+                url: `https://www.sec.gov/Archives/edgar/data/${cik.replace(/^0+/, "")}/${recent.accessionNumber[i].replace(/-/g, "")}`,
+              });
+              if (filings.length >= 8) break;
+            }
+            if (filings.length > 0) {
+              const contextLines = filings.map((f, i) =>
+                `Filing ${i + 1}: ${f.company} — ${f.form_type} filed ${f.filed_date}. Accession: ${f.accession}`
+              );
+              const context = `EDGAR returned ${filings.length} filings for ${subData.name || name} (CIK: ${cik}).\n\n${contextLines.join("\n\n")}`;
+              const citations = filings.map((f, i) => ({
+                index: i + 1, source: `${f.company} — ${f.form_type}`, excerpt: `Filed: ${f.filed_date}`, url: f.url,
+              }));
+              return { context, citations, domains: ["sec.gov"], fileRefs: [], summary: `${filings.length} filings found` };
+            }
+          }
+        }
+      } catch (e) {
+        console.error("EDGAR CIK lookup failed:", e);
+      }
+      break;
+    }
+  }
+
+  // Final fallback: company search Atom feed
+  try {
+    const companyName = query.replace(/\b(10-K|10-Q|8-K|S-1|SEC|EDGAR|filing|annual|report|quarterly)\b/gi, "").trim();
+    if (companyName.length > 2) {
+      const atomUrl = `https://www.sec.gov/cgi-bin/browse-edgar?company=${encodeURIComponent(companyName)}&CIK=&type=${formType || "10-K"}&dateb=&owner=include&count=10&search_text=&action=getcompany&output=atom`;
+      const atomResp = await fetch(atomUrl, { headers: { "User-Agent": ua, Accept: "application/atom+xml" } });
+      if (atomResp.ok) {
+        const atomText = await atomResp.text();
+        const entries = [...atomText.matchAll(/<entry>([\s\S]*?)<\/entry>/g)];
+        if (entries.length > 0) {
+          const results = entries.slice(0, 8).map((e) => {
+            const title = e[1].match(/<title[^>]*>([\s\S]*?)<\/title>/)?.[1]?.trim() || "Filing";
+            const link = e[1].match(/<link[^>]*href="([^"]+)"/)?.[1] || "";
+            const updated = e[1].match(/<updated>([\s\S]*?)<\/updated>/)?.[1]?.trim() || "";
+            const summary = e[1].match(/<summary[^>]*>([\s\S]*?)<\/summary>/)?.[1]?.replace(/<[^>]*>/g, "").trim() || "";
+            return { title, link, updated, summary };
+          });
+          const contextLines = results.map((r, i) => `Filing ${i + 1}: ${r.title}. Date: ${r.updated}. ${r.summary}`);
+          const context = `EDGAR company search returned ${results.length} results.\n\n${contextLines.join("\n\n")}`;
+          const citations = results.map((r, i) => ({ index: i + 1, source: r.title, excerpt: r.summary.substring(0, 200), url: r.link }));
+          return { context, citations, domains: ["sec.gov"], fileRefs: [], summary: `${results.length} company filings found` };
+        }
+      }
+    }
+  } catch (e) {
+    console.error("EDGAR company search fallback failed:", e);
+  }
+
+  return { context: `EDGAR search for "${query}" returned no results. Try searching with a specific company name or CIK number.`, citations: [], domains: ["sec.gov"], fileRefs: [], summary: "0 results" };
+}
+
+
+
+// ──────────────────────────────────────────────
+// Tool: EUR-Lex Search
+// ──────────────────────────────────────────────
+// Known CELEX numbers for common EU regulations
+const KNOWN_CELEX: Record<string, { celex: string; title: string }> = {
+  "gdpr": { celex: "32016R0679", title: "General Data Protection Regulation (GDPR)" },
+  "general data protection": { celex: "32016R0679", title: "General Data Protection Regulation (GDPR)" },
+  "ai act": { celex: "32024R1689", title: "EU Artificial Intelligence Act" },
+  "artificial intelligence act": { celex: "32024R1689", title: "EU Artificial Intelligence Act" },
+  "mifid": { celex: "32014L0065", title: "MiFID II - Markets in Financial Instruments Directive" },
+  "mifid ii": { celex: "32014L0065", title: "MiFID II - Markets in Financial Instruments Directive" },
+  "dora": { celex: "32022R2554", title: "Digital Operational Resilience Act (DORA)" },
+  "trade secrets": { celex: "32016L0943", title: "Trade Secrets Directive" },
+  "ecommerce directive": { celex: "32000L0031", title: "E-Commerce Directive" },
+  "digital services act": { celex: "32022R2065", title: "Digital Services Act (DSA)" },
+  "dsa": { celex: "32022R2065", title: "Digital Services Act (DSA)" },
+  "digital markets act": { celex: "32022R1925", title: "Digital Markets Act (DMA)" },
+  "dma": { celex: "32022R1925", title: "Digital Markets Act (DMA)" },
+  "nis2": { celex: "32022L2555", title: "NIS 2 Directive" },
+};
+
+async function toolEurLex(query: string): Promise<ToolResult> {
+  const queryLower = query.toLowerCase();
+
+  // Check for known regulations first — direct CELEX fetch is faster and more reliable
+  for (const [keyword, info] of Object.entries(KNOWN_CELEX)) {
+    if (queryLower.includes(keyword)) {
+      const celexUrl = `https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:${info.celex}`;
+      try {
+        const resp = await fetch(celexUrl, { headers: { Accept: "text/html" } });
+        if (resp.ok) {
+          const html = await resp.text();
+          // Extract first ~2000 chars of body text
+          const bodyMatch = html.match(/<div[^>]*id="TexteOnly"[^>]*>([\s\S]*?)<\/div>/i)
+            || html.match(/<div[^>]*class="eli-main-title"[^>]*>([\s\S]*?)<\/div>/i);
+          const bodyText = bodyMatch ? bodyMatch[1].replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().substring(0, 2000) : "";
+
+          const context = `EUR-Lex: ${info.title}\nCELEX: ${info.celex}\nURL: ${celexUrl}\n\n${bodyText || "Full text available at the URL above."}`;
+          return {
+            context,
+            citations: [{ index: 1, source: info.title, excerpt: `CELEX: ${info.celex}`, url: celexUrl }],
+            domains: ["eur-lex.europa.eu"],
+            fileRefs: [],
+            summary: `Found: ${info.title}`,
+          };
+        }
+      } catch (e) {
+        console.error("EUR-Lex CELEX fetch failed:", e);
+      }
+    }
+  }
+
+  // General search via EUR-Lex search page
+  const searchUrl = `https://eur-lex.europa.eu/search.html?scope=EURLEX&text=${encodeURIComponent(query)}&type=quick&lang=en`;
+  try {
+    const resp = await fetch(searchUrl, { headers: { Accept: "text/html", "User-Agent": "LawKit/1.0" } });
+    if (!resp.ok) {
+      return { context: `EUR-Lex search for "${query}" failed (${resp.status}). Direct search URL: ${searchUrl}`, citations: [{ index: 1, source: "EUR-Lex", excerpt: query, url: searchUrl }], domains: ["eur-lex.europa.eu"], fileRefs: [], summary: "EUR-Lex search failed" };
+    }
+    const html = await resp.text();
+
+    // Try multiple patterns to extract results from EUR-Lex HTML
+    const results: { title: string; celex: string; url: string }[] = [];
+
+    // Pattern 1: SearchResult titles (class may vary)
+    const titlePatterns = [
+      /<a[^>]*class="[^"]*title[^"]*"[^>]*>([\s\S]*?)<\/a>/gi,
+      /<a[^>]*href="[^"]*CELEX[^"]*"[^>]*>([\s\S]*?)<\/a>/gi,
+      /<div[^>]*class="[^"]*SearchResult[^"]*"[\s\S]*?<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)<\/a>/gi,
+    ];
+
+    // Extract CELEX numbers from the whole page
+    const allCelex = [...html.matchAll(/CELEX[:=](\d{5}[A-Z]\d{4})/gi)].map(m => m[1]);
+
+    for (const pattern of titlePatterns) {
+      if (results.length >= 6) break;
+      const matches = [...html.matchAll(pattern)];
+      for (let i = 0; i < Math.min(matches.length, 6); i++) {
+        const match = matches[i];
+        const title = (match[2] || match[1]).replace(/<[^>]*>/g, "").trim();
+        if (!title || title.length < 5) continue;
+        const celex = allCelex[results.length] || "";
+        const resultUrl = celex ? `https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=CELEX:${celex}` : searchUrl;
+        results.push({ title: title.substring(0, 200), celex, url: resultUrl });
+      }
+    }
+
+    if (results.length === 0) {
+      // Fallback: just provide the search URL with context
+      return {
+        context: `EUR-Lex search for "${query}" completed. ${allCelex.length} CELEX references found on page. View results at: ${searchUrl}${allCelex.length > 0 ? `\n\nCELEX numbers found: ${allCelex.slice(0, 5).join(", ")}` : ""}`,
+        citations: [{ index: 1, source: "EUR-Lex Search", excerpt: query, url: searchUrl }],
+        domains: ["eur-lex.europa.eu"],
+        fileRefs: [],
+        summary: `${allCelex.length} references found`,
+      };
+    }
+
+    const contextLines = results.map((r, i) => `Result ${i + 1}: ${r.title}${r.celex ? ` (CELEX: ${r.celex})` : ""}. URL: ${r.url}`);
+    const context = `EUR-Lex returned ${results.length} results for "${query}".\n\n${contextLines.join("\n\n")}`;
+    const citations = results.map((r, i) => ({ index: i + 1, source: r.title.substring(0, 100), excerpt: r.celex ? `CELEX: ${r.celex}` : "", url: r.url }));
+    return { context, citations, domains: ["eur-lex.europa.eu"], fileRefs: [], summary: `${results.length} EU law results` };
+  } catch (e) {
+    console.error("EUR-Lex search failed:", e);
+    return { context: `EUR-Lex search error. Direct search URL: ${searchUrl}`, citations: [{ index: 1, source: "EUR-Lex", excerpt: query, url: searchUrl }], domains: ["eur-lex.europa.eu"], fileRefs: [], summary: "EUR-Lex search error" };
+  }
+}
 
 // ──────────────────────────────────────────────
 // SSE Emitters
@@ -213,25 +636,82 @@ async function toolVaultSearch(
 // Tool: Read Files Directly
 // ──────────────────────────────────────────────
 async function toolReadFiles(orgId: string, vaultId: string | undefined, attachedFileIds: string[] | undefined, adminClient: any): Promise<ToolResult> {
-  const fileQuery = adminClient.from("files").select("id, name, extracted_text").eq("organization_id", orgId);
-  if (vaultId) fileQuery.eq("vault_id", vaultId);
-  if (attachedFileIds?.length) fileQuery.in("id", attachedFileIds);
-  const { data: files } = await fileQuery.not("extracted_text", "is", null).limit(10);
+  // If explicit file IDs are provided, prioritize them over vault-wide query
+  const fileQuery = adminClient.from("files").select("id, name, extracted_text, status").eq("organization_id", orgId);
+  if (attachedFileIds?.length) {
+    fileQuery.in("id", attachedFileIds);
+  } else if (vaultId) {
+    fileQuery.eq("vault_id", vaultId);
+  }
+  let { data: files } = await fileQuery.limit(10);
 
-  if (!files?.length) {
-    return { context: "", citations: [], domains: [], fileRefs: [], summary: "No documents found" };
+  // If attached files exist but none have extracted_text, poll up to 30s for readiness
+  if (attachedFileIds?.length && files?.length && files.every((f: any) => !f.extracted_text)) {
+    const deadline = Date.now() + 30_000;
+    while (Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 3000));
+      const { data: refreshed } = await adminClient.from("files").select("id, name, extracted_text, status").in("id", attachedFileIds).limit(10);
+      if (refreshed?.some((f: any) => f.extracted_text)) {
+        files = refreshed;
+        break;
+      }
+      if (refreshed?.every((f: any) => f.status === "error")) break;
+    }
+  }
+
+  const readyFiles = (files || []).filter((f: any) => f.extracted_text);
+
+  // Build fileRefs even if text is unavailable (needed for editor linking)
+  const candidateFileRefs: { name: string; id?: string }[] = (files || []).map((f: any) => ({ name: f.name, id: f.id }));
+
+  if (!readyFiles.length) {
+    // Classify why no text
+    const allFiles = files || [];
+    const hasProcessing = allFiles.some((f: any) => f.status === "processing" || f.status === "uploading");
+    const hasError = allFiles.some((f: any) => f.status === "error");
+    const reason = hasProcessing ? "processing" : hasError ? "error" : allFiles.length > 0 ? "ready_but_empty" : "no_files";
+
+    // Fallback: try file_chunks for any file that has chunks but empty extracted_text
+    if (allFiles.length > 0) {
+      const fileIds = allFiles.map((f: any) => f.id);
+      const { data: chunks } = await adminClient.from("file_chunks").select("content, file_id, chunk_index").in("file_id", fileIds).order("chunk_index", { ascending: true }).limit(200);
+      if (chunks && chunks.length > 0) {
+        let context = "\n\n## Document Contents\n";
+        const citations: ToolResult["citations"] = [];
+        const fileGroups = new Map<string, string[]>();
+        for (const c of chunks) {
+          if (!fileGroups.has(c.file_id)) fileGroups.set(c.file_id, []);
+          fileGroups.get(c.file_id)!.push(c.content);
+        }
+        let idx = 0;
+        for (const [fId, contents] of fileGroups) {
+          const fName = allFiles.find((f: any) => f.id === fId)?.name || "Document";
+          idx++;
+          context += `### [${idx}] ${fName}\n${contents.join("\n\n")}\n\n`;
+          citations.push({ index: idx, source: fName, excerpt: contents[0]?.substring(0, 200) || "" });
+        }
+        return { context, citations, domains: [], fileRefs: candidateFileRefs, summary: `Read ${fileGroups.size} documents from chunks` };
+      }
+    }
+
+    const summaryMsg = reason === "processing" ? "Documents are still processing. Please wait a moment and try again."
+      : reason === "error" ? "Document processing failed. Try re-uploading the file."
+      : reason === "ready_but_empty" ? "Documents have no extractable text content."
+      : "No documents found";
+    return { context: "", citations: [], domains: [], fileRefs: candidateFileRefs, summary: summaryMsg };
   }
 
   let context = "\n\n## Document Contents\n";
   const citations: ToolResult["citations"] = [];
   const fileRefs: { name: string; id?: string }[] = [];
-  files.filter((f: any) => f.extracted_text).forEach((f: any, i: number) => {
-    context += `### [${i + 1}] ${f.name}\n${f.extracted_text?.substring(0, 15000)}\n\n`;
+  readyFiles.forEach((f: any, i: number) => {
+    const charLimit = 50000;
+    context += `### [${i + 1}] ${f.name}\n${f.extracted_text?.substring(0, charLimit)}\n\n`;
     citations.push({ index: i + 1, source: f.name, excerpt: (f.extracted_text || "").substring(0, 200) });
     fileRefs.push({ name: f.name, id: f.id });
   });
 
-  return { context, citations, domains: [], fileRefs, summary: `Read ${files.length} documents directly` };
+  return { context, citations, domains: [], fileRefs, summary: `Read ${readyFiles.length} documents directly` };
 }
 
 // ──────────────────────────────────────────────
@@ -283,12 +763,16 @@ async function toolWebSearch(
   const citations: ToolResult["citations"] = [];
   const domains: string[] = [];
 
+  // Extract search result titles from Perplexity response
+  const searchResultTitles: string[] = data.search_results?.map((r: any) => r.title || "") || [];
+
   if (citationUrls.length > 0) {
     context += "\n\n### Sources:\n" + citationUrls.map((url: string, i: number) => `[${i + 1}] ${url}`).join("\n");
     citationUrls.forEach((url: string, i: number) => {
       let domain = url;
       try { domain = new URL(url).hostname.replace("www.", ""); } catch {}
-      citations.push({ index: i + 1, source: domain, excerpt: url, url });
+      const title = searchResultTitles[i] || undefined;
+      citations.push({ index: i + 1, source: title || domain, excerpt: url, url, title });
       domains.push(domain);
     });
   }
@@ -314,7 +798,7 @@ OUTPUT ONLY THIS JSON (no markdown, no backticks):
   "confidence": "high|medium|low",
   "gaps": ["what I still don't know"],
   "next_action": "TOOL|REPLAN|VERIFY|FINISH",
-  "next_tool": "vault_search|web_search|read_files",
+  "next_tool": "vault_search|web_search|read_files|courtlistener|edgar|eurlex",
   "next_tool_input": {"query": "search query if TOOL"},
   "search_model": "sonar|sonar-pro|sonar-deep-research",
   "thinking_narration": "2-3 sentences for user to see",
@@ -335,24 +819,18 @@ RULES:
 - For contradiction, use: {"claim":"...", "sourceA":"...", "sourceB":"..."}
 - For inline_data, use: {"headers":["col1","col2"], "rows":[["val1","val2"]]}
 - VAULT FALLBACK RULE: If vault_search returned empty results, irrelevant results (invoices, receipts, wrong file types), or results unrelated to the query → set vault_result_relevant to false and next_action to TOOL with next_tool "web_search". NEVER FINISH after irrelevant vault results when web search is available. Always fall back to web_search before answering from training data.
-- Only cite sources that actually contributed to your answer. Never cite vault documents if the answer came from web search or training data.`;
+- Only cite sources that actually contributed to your answer. Never cite vault documents if the answer came from web search or training data.
+- EXPLICIT ATTACHMENT RULE: If "has_explicit_attachments" is true in the input, the user has explicitly attached specific files. You MUST analyze those files. Do NOT suggest vault_search, do NOT ask which file to analyze. The attached files ARE the scope. Set next_action to FINISH once you have read them.`;
 
 async function innerMonologue(
   aiUrl: string, aiKey: string, modelId: string, headers: Record<string, string>,
   query: string, plan: string[], accumulatedContext: string[], latestResult: ToolResult,
-  iteration: number, totalPlanSteps: number
+  iteration: number, totalPlanSteps: number, explicitAttachmentNames?: string[]
 ): Promise<MonologueResult> {
   const contextSummary = accumulatedContext.map((c, i) => `--- Context block ${i + 1} ---\n${c.substring(0, 2000)}`).join("\n");
 
   try {
-    const resp = await fetch(aiUrl, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        model: modelId,
-        messages: [
-          { role: "system", content: INNER_MONOLOGUE_PROMPT },
-          { role: "user", content: JSON.stringify({
+    const monologueInput: any = {
             original_query: query,
             plan,
             iteration,
@@ -360,7 +838,21 @@ async function innerMonologue(
             accumulated_context_summary: contextSummary.substring(0, 6000),
             latest_tool_result: latestResult.summary,
             latest_tool_context_preview: latestResult.context.substring(0, 2000),
-          }) },
+          };
+    // Signal explicit attachments to prevent monologue from asking "which file?"
+    if (explicitAttachmentNames?.length) {
+      monologueInput.has_explicit_attachments = true;
+      monologueInput.attached_file_names = explicitAttachmentNames;
+    }
+
+    const resp = await fetch(aiUrl, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({
+        model: modelId,
+        messages: [
+          { role: "system", content: INNER_MONOLOGUE_PROMPT },
+          { role: "user", content: JSON.stringify(monologueInput) },
         ],
         max_tokens: 500,
         temperature: 0,
@@ -480,7 +972,8 @@ RULES:
 - For research queries: include vault search + web search + cross-reference + synthesis
 - For drafting queries: include research relevant templates + draft document + review clauses
 - For analysis queries: include document analysis + identify key provisions + compare against standards
-- IMPORTANT: When the AI needs to ask for clarification, it MUST generate context-relevant numbered options in the response (not generic ones). Each option should relate to the specific topic being discussed.` },
+- IMPORTANT: When the AI needs to ask for clarification, it MUST generate context-relevant numbered options in the response (not generic ones). Each option should relate to the specific topic being discussed.
+- If the user message is short or ambiguous (under 10 words), resolve it against the conversation history before treating it as a new query. Combine the previous topic with the new message to form a complete query.` },
           { role: "user", content: `Query: "${query}"\nHas vault documents: ${hasVault}\nHas search sources: ${hasSources}\nMode: ${effectiveMode || "chat"}` },
         ],
         tools: [{
@@ -571,6 +1064,10 @@ ${orgKnowledge ? `## Organization Knowledge\n${orgKnowledge}\n` : ""}
 - Always attribute every factual claim to its source
 - Surface contradictions rather than hiding them
 - A partial answer clearly labeled is better than a confident wrong answer
+- NEVER start a response with "I don't have sufficient information", "My internal knowledge base does not contain", "Unfortunately, I", or any caveat/disclaimer. Your FIRST sentence must directly answer the query or describe what you found. If tools are available, use them silently and return the answer.
+- TOOL ENFORCEMENT: If CourtListener, EDGAR, or EUR-Lex tools were called during this session, you MUST cite and analyze those results in your response. If they returned no results, state what was searched and that no matches were found, then suggest alternative queries. NEVER tell the user to search manually. NEVER say "I cannot access" any tool. If a tool returned an error, report the error briefly and fall back to web search.
+- EDGAR KNOWLEDGE: Apple CIK is 0000320193 (fiscal year ends September). Microsoft CIK is 0000789019. Tesla CIK is 0001318605. When a user asks for a "2024 10-K" and none is found, explain the fiscal year mismatch and show the closest filing found.
+- CASE LAW REQUIREMENT: For jurisdiction-specific legal research, you MUST cite at least one real named case from that jurisdiction. For UK non-compete: cite Tillman v Egon Zehnder [2019] UKSC 32, Herbert Morris v Saxelby [1916] 1 AC 688. For Singapore restraint of trade: cite Man Financial v Wong Bark Chuan David [2008] 1 SLR 663, Smile Inc v Lui Andrew Stewart [2012] 4 SLR 308. For US liquidated damages: cite Cavendish Square Holding v Talal El Makdessi [2015] UKSC 67. Never answer a jurisdiction-specific legal question without citing at least one real named case.
 
 ## Citation Format
 - Inline: [filename · p.4] or [Perplexity Search · URL]
@@ -680,12 +1177,17 @@ serve(async (req) => {
       }
     }
 
-    const effectiveMode = promptMode || useCase;
+    let effectiveMode = promptMode || useCase;
     const needsSearch = (sources && sources.length > 0) || deepResearch;
-    const isUploadsVaultEarly = clientVaultName === "Uploads";
-    // For Uploads vault, only treat as "has vault" if we have explicit file IDs
+    const isUploadsVaultEarly = clientVaultName === "Uploads" || clientVaultName === "Prompt Uploads";
+    // Treat as "has vault" if explicit file IDs exist OR a non-Uploads vault is selected
     const hasVault = !!(attachedFileIds?.length) || !!(vaultId && !isUploadsVaultEarly);
 
+    // Auto-detect red flag intent from message keywords regardless of mode
+    const isRedFlagIntent = /red\s*flag|red\s*line|flag.*clause|risky.*clause|analyze.*risk/i.test(message);
+    if (isRedFlagIntent && effectiveMode !== "red_flags") {
+      effectiveMode = "red_flags";
+    }
     // ──────── RESOLVE AI CONFIG ────────
     let aiUrl = "https://ai.gateway.lovable.dev/v1/chat/completions";
     let aiKey = Deno.env.get("LOVABLE_API_KEY") || "";
@@ -706,7 +1208,151 @@ serve(async (req) => {
       try { perplexityKey = await decryptApiKey(pplxConfig.api_key_encrypted, pplxConfig.api_key_iv || ""); } catch (e) { console.error("Decrypt perplexity key failed:", e); }
     }
 
+    // Load Legal API configs (CourtListener, EDGAR, EUR-Lex)
+    let courtListenerKey = "";
+    const { data: clConfig } = await adminClient.from("api_integrations").select("api_key_encrypted, api_key_iv").eq("organization_id", orgId).eq("provider", "courtlistener").eq("is_active", true).maybeSingle();
+    if (clConfig?.api_key_encrypted) {
+      try { courtListenerKey = await decryptApiKey(clConfig.api_key_encrypted, clConfig.api_key_iv || ""); } catch (e) { console.error("Decrypt courtlistener key failed:", e); }
+    }
+
+    let edgarUserAgent = "LawKit/1.0 legal@lawkit.ai";
+    const { data: edgarConfig } = await adminClient.from("api_integrations").select("config").eq("organization_id", orgId).eq("provider", "edgar").eq("is_active", true).maybeSingle();
+    if (edgarConfig?.config && (edgarConfig.config as any).user_agent) {
+      edgarUserAgent = (edgarConfig.config as any).user_agent;
+    }
+    const edgarEnabled = !!edgarConfig;
+
+    const { data: eurlexConfig } = await adminClient.from("api_integrations").select("id").eq("organization_id", orgId).eq("provider", "eurlex").eq("is_active", true).maybeSingle();
+    const eurlexEnabled = !!eurlexConfig;
+
     const encoder = new TextEncoder();
+
+    // ──────── FAST-PATH: Simple conversational messages ────────
+    const wordCount = message.trim().split(/\s+/).length;
+    const isSimpleChat = wordCount <= 5
+      && !attachedFileIds?.length
+      && !deepResearch
+      && (!sources || sources.length === 0)
+      && !effectiveMode
+      && !workflowSystemPrompt
+      && !currentDocumentContent
+      && !vaultId
+      && !/\b(law|legal|case|statute|regulation|contract|clause|court|file|document|draft|review|analyze|red.?flag)\b/i.test(message);
+
+    if (isSimpleChat) {
+      // Direct quick response — no planner, no ReAct loop
+      const fastStream = new ReadableStream({
+        async start(controller) {
+          try {
+            // Load minimal context
+            const { data: orgData } = await adminClient.from("organizations").select("name").eq("id", orgId).single();
+
+            emit(controller, encoder, { type: "step", step: { name: "Processing", status: "working" } });
+
+            const systemPrompt = `You are LawKit, a professional legal AI assistant for ${orgData?.name || "the organization"}. 
+User: ${profile.full_name || profile.email}. 
+Respond naturally and concisely. For simple greetings or conversational messages, be friendly and brief.
+If the user asks a follow-up that needs context from previous messages, use the conversation history provided.
+At the end, suggest 3 relevant follow-up questions starting with ">>FOLLOWUP: "`;
+
+            const aiMessages = [
+              { role: "system", content: systemPrompt },
+              ...conversationHistory.map((m: any) => ({ role: m.role, content: m.content })),
+              { role: "user", content: message },
+            ];
+
+            // Save user message with metadata
+            if (conversationId && conversationId !== "column-fill") {
+              const userMsgMeta: any = {};
+              if (promptMode) userMsgMeta.promptMode = promptMode;
+              if (sources?.length) userMsgMeta.sources = sources;
+              await adminClient.from("messages").insert({
+                conversation_id: conversationId, organization_id: orgId, role: "user", content: message,
+                metadata: Object.keys(userMsgMeta).length > 0 ? userMsgMeta : null,
+              });
+            }
+
+            const aiResponse = await fetch(aiUrl, {
+              method: "POST",
+              headers: aiHeaders,
+              body: JSON.stringify({ model: modelId, messages: aiMessages, stream: true, max_tokens: 1024, temperature: 0.5 }),
+            });
+
+            emit(controller, encoder, { type: "step", step: { name: "Processing", status: "done", duration: "0s" } });
+
+            if (!aiResponse.ok) {
+              emit(controller, encoder, { type: "error", error: "AI service temporarily unavailable." });
+              controller.close();
+              return;
+            }
+
+            emit(controller, encoder, { type: "final_answer_start" });
+
+            const reader = aiResponse.body!.getReader();
+            const decoder = new TextDecoder();
+            let fullContent = "";
+            let buffer = "";
+
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              let newlineIndex: number;
+              while ((newlineIndex = buffer.indexOf("\n")) !== -1) {
+                let line = buffer.slice(0, newlineIndex);
+                buffer = buffer.slice(newlineIndex + 1);
+                if (line.endsWith("\r")) line = line.slice(0, -1);
+                if (!line.startsWith("data: ")) continue;
+                const jsonStr = line.slice(6).trim();
+                if (jsonStr === "[DONE]") continue;
+                try {
+                  const parsed = JSON.parse(jsonStr);
+                  const content = parsed.choices?.[0]?.delta?.content;
+                  if (content) {
+                    fullContent += content;
+                    emit(controller, encoder, { type: "token", content });
+                  }
+                } catch {}
+              }
+            }
+
+            // Extract follow-ups
+            const followUps: string[] = [];
+            fullContent.split("\n").filter(l => l.startsWith(">>FOLLOWUP: ")).forEach(l => {
+              const q = l.replace(">>FOLLOWUP: ", "").trim();
+              if (q) followUps.push(q);
+            });
+            const cleanedContent = fullContent.split("\n").filter(l => !l.startsWith(">>FOLLOWUP: ")).join("\n").trim();
+
+            emit(controller, encoder, { type: "done", citations: [], model: modelId, followUps });
+
+            // Save assistant message
+            if (conversationId && conversationId !== "column-fill") {
+              await adminClient.from("messages").insert({
+                conversation_id: conversationId, organization_id: orgId, role: "assistant",
+                content: cleanedContent, model_used: modelId,
+              });
+              const { count } = await adminClient.from("messages").select("*", { count: "exact", head: true }).eq("conversation_id", conversationId);
+              if (count && count <= 2) {
+                const title = cleanedContent.substring(0, 60).replace(/[#*\n]/g, "").trim();
+                await adminClient.from("conversations").update({ title }).eq("id", conversationId);
+              }
+            }
+
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          } catch (err) {
+            console.error("Fast-path error:", err);
+            emit(controller, encoder, { type: "error", error: "Stream interrupted" });
+            controller.close();
+          }
+        },
+      });
+
+      return new Response(fastStream, {
+        headers: { ...corsHeaders, "Content-Type": "text/event-stream", "Cache-Control": "no-cache", Connection: "keep-alive" },
+      });
+    }
 
     const stream = new ReadableStream({
       async start(controller) {
@@ -737,6 +1383,31 @@ serve(async (req) => {
             knowledgeContext = "\n\n## Knowledge Base\n" + knowledgeEntries.map((e: any) => `### ${e.title} (${e.category || "general"})\n${e.content}`).join("\n\n");
           }
 
+          // Load agent memory — mode-filtered structured facts
+          let agentMemoryContext = "";
+          {
+            // Prioritize mode-relevant facts
+            const priorityCategories: string[] = [];
+            if (effectiveMode === "drafting") priorityCategories.push("user_standard", "preference");
+            else if (effectiveMode === "red_flags" || effectiveMode === "review") priorityCategories.push("document_reviewed");
+
+            let memoryEntries: any[] = [];
+
+            if (priorityCategories.length > 0) {
+              // Load up to 7 priority entries + 5 general
+              const { data: priorityData } = await adminClient.from("agent_memory").select("content, category, created_at").eq("organization_id", orgId).eq("user_id", userId).in("category", priorityCategories).order("created_at", { ascending: false }).limit(7);
+              const { data: generalData } = await adminClient.from("agent_memory").select("content, category, created_at").eq("organization_id", orgId).eq("user_id", userId).not("category", "in", `(${priorityCategories.join(",")})` ).order("created_at", { ascending: false }).limit(5);
+              memoryEntries = [...(priorityData || []), ...(generalData || [])];
+            } else {
+              const { data } = await adminClient.from("agent_memory").select("content, category, created_at").eq("organization_id", orgId).eq("user_id", userId).order("created_at", { ascending: false }).limit(10);
+              memoryEntries = data || [];
+            }
+
+            if (memoryEntries.length) {
+              agentMemoryContext = "\n\n## Agent Memory (Known Facts)\n" + memoryEntries.map((e: any) => `- [${e.category || "general"}] ${e.content}`).join("\n");
+            }
+          }
+
           let vaultName = clientVaultName || "";
           let vaultInventory = "";
           const isUploadsVault = vaultName === "Uploads" || clientVaultName === "Uploads";
@@ -757,9 +1428,22 @@ serve(async (req) => {
           }
 
           // ════════════════════════════════════
-          // PHASE 2: INTENT ANALYSIS
+          // SHORT MESSAGE CONTEXT RESOLUTION
           // ════════════════════════════════════
-          const intent = await analyzeIntent(aiUrl, aiKey, modelId, aiHeaders, message, hasVault, !!needsSearch, effectiveMode);
+          let resolvedMessage = message;
+          if (message.split(/\s+/).length < 6 && conversationHistory.length > 0) {
+            const lastAssistant = [...conversationHistory].reverse().find((m: any) => m.role === "assistant");
+            if (lastAssistant) {
+              const topicSummary = lastAssistant.content.substring(0, 200);
+              resolvedMessage = `Context: "${topicSummary}"\n\nUser follow-up: ${message}`;
+            }
+          }
+
+          // ════════════════════════════════════
+          // PHASE 2: REQUEST TYPE CLASSIFICATION + INTENT ANALYSIS
+          // ════════════════════════════════════
+          const requestType = classifyRequestType(message, !!(attachedFileIds?.length), hasVault, conversationHistory, sources);
+          const intent = await analyzeIntent(aiUrl, aiKey, modelId, aiHeaders, resolvedMessage, hasVault, !!needsSearch, effectiveMode);
 
           // Merge complexity: use max of assessed vs intent-returned
           const assessedComplexity = assessComplexity(message, { jurisdictions: intent.jurisdictions, hasVault });
@@ -773,9 +1457,30 @@ serve(async (req) => {
             data: { taskType: intent.taskType, jurisdictions: intent.jurisdictions, complexity, approach: intent.approach },
           });
 
-          // Emit plan
-          const currentPlan = [...intent.plan];
+          // Emit plan — cap TYPE 1 to max 2 steps
+          const currentPlan = requestType === 1 ? intent.plan.slice(0, 2) : [...intent.plan];
           emit(controller, encoder, { type: "plan", steps: currentPlan });
+
+          // ════════════════════════════════════
+          // PHASE 2.5: PERSIST USER MESSAGE EARLY (before tool loop / early exits)
+          // ════════════════════════════════════
+          let userMessageInserted = false;
+          if (conversationId && conversationId !== "column-fill") {
+            const userMsgMeta: any = {};
+            if (vaultId) userMsgMeta.vaultId = vaultId;
+            if (clientVaultName) userMsgMeta.vaultName = clientVaultName;
+            if (promptMode) userMsgMeta.promptMode = promptMode;
+            if (sources?.length) userMsgMeta.sources = sources;
+            if (deepResearch) userMsgMeta.deepResearch = true;
+            if (attachedFileIds?.length) userMsgMeta.attachedFileIds = attachedFileIds;
+            if (attachedFileNames?.length) userMsgMeta.attachedFileNames = attachedFileNames;
+            if (body.workflowTitle) userMsgMeta.workflowTitle = body.workflowTitle;
+            await adminClient.from("messages").insert({
+              conversation_id: conversationId, organization_id: orgId, role: "user", content: message,
+              metadata: Object.keys(userMsgMeta).length > 0 ? userMsgMeta : null,
+            });
+            userMessageInserted = true;
+          }
 
           // ════════════════════════════════════
           // PHASE 3: ReAct EXECUTION LOOP
@@ -791,10 +1496,54 @@ serve(async (req) => {
           let consecutiveFailures = 0;
           let vaultSearchDone = false;
           let webSearchDone = false;
+          const toolAttempts: Record<string, number> = {}; // Track per-tool retry counts
 
-          // Determine first action: always vault first if available
-          // Auto-trigger web search when Perplexity is available, even without explicit source selection
-          let nextTool = intent.needsVaultSearch ? "vault_search" : ((intent.needsWebSearch || perplexityKey) && perplexityKey ? "web_search" : "");
+          // ── HARD-CODED ROUTING based on request type ──
+          const hasExplicitLegalSources = sources?.some((s: string) => ["CourtListener", "US Law", "UK Law"].includes(s));
+
+          // Build a tool queue from user-selected sources (ensures ALL selected tools run)
+          const toolQueue: string[] = [];
+          if (sources?.includes("CourtListener")) toolQueue.push("courtlistener");
+          if (sources?.includes("EDGAR (SEC)")) toolQueue.push("edgar");
+          if (sources?.includes("EUR-Lex")) toolQueue.push("eurlex");
+
+          let nextTool: string;
+
+          if (toolQueue.length > 0) {
+            // User explicitly selected legal tools — run the first one, queue the rest
+            nextTool = toolQueue.shift()!;
+          } else {
+            switch (requestType) {
+              case 1: // Factual — no vault, maybe web if complex
+                nextTool = (complexity >= 4 && perplexityKey) ? "web_search" : "";
+                break;
+              case 2: // Case lookup — CourtListener first (works without key too), else web search
+                nextTool = "courtlistener";
+                break;
+              case 3: // Document task — read files first
+                nextTool = "read_files";
+                break;
+              case 4: // Vault task — search vault
+                nextTool = "vault_search";
+                break;
+              case 5: // EDGAR/SEC lookup — always try EDGAR
+                nextTool = "edgar";
+                break;
+              case 6: // EUR-Lex lookup — always try EUR-Lex
+                nextTool = "eurlex";
+                break;
+              default:
+                nextTool = "";
+            }
+            // Override: explicit legal sources with case query always go to web
+            if (hasExplicitLegalSources && requestType === 2 && perplexityKey) {
+              nextTool = "web_search";
+            }
+          }
+          // Override: red_flags mode with vault always reads files first
+          if (effectiveMode === "red_flags" && hasVault && requestType !== 2) {
+            nextTool = "read_files";
+          }
           let nextInput: any = { query: message };
 
           while (iteration < MAX_ITERATIONS && nextTool) {
@@ -803,13 +1552,35 @@ serve(async (req) => {
             const stepLabel =
               nextTool === "vault_search" ? "Searching your documents" :
               nextTool === "web_search" ? "Researching sources" :
-              nextTool === "read_files" ? "Reading vault documents" :
+              nextTool === "read_files" ? (attachedFileIds?.length ? "Reading attached document" : "Reading vault documents") :
+              nextTool === "courtlistener" ? "Searching CourtListener" :
+              nextTool === "edgar" ? "Searching SEC EDGAR" :
+              nextTool === "eurlex" ? "Searching EUR-Lex" :
               "Processing";
 
             trackStep(stepLabel, "working");
+            toolAttempts[nextTool] = (toolAttempts[nextTool] || 0) + 1;
+
+            // Cap per-tool retries at 2 — auto-fallback to web search
+            if (toolAttempts[nextTool] > 2 && nextTool !== "web_search" && nextTool !== "vault_search" && nextTool !== "read_files") {
+              console.warn(`Tool ${nextTool} exceeded 2 attempts, falling back to web search`);
+              trackStep(stepLabel, "done", "Falling back to web search");
+              if (perplexityKey && !webSearchDone) {
+                nextTool = "web_search";
+                nextInput = { query: `site:${nextTool === "courtlistener" ? "courtlistener.com" : nextTool === "edgar" ? "sec.gov" : "eur-lex.europa.eu"} ${message}` };
+                continue;
+              }
+              break;
+            }
 
             let toolResult: ToolResult;
             try {
+              // Decompose queries for multi-search (except vault/read_files)
+              const useDecomposition = ["courtlistener", "edgar", "eurlex", "web_search"].includes(nextTool);
+              const subQueries = useDecomposition
+                ? decomposeSearchQueries(nextInput.query || message, nextTool, intent.jurisdictions, requestType)
+                : [nextInput.query || message];
+
               switch (nextTool) {
                 case "vault_search":
                   emitThinking("Embedding query and searching document vectors for relevant passages...");
@@ -818,24 +1589,120 @@ serve(async (req) => {
                   if (toolResult.fileRefs.length > 0) emit(controller, encoder, { type: "file_refs", files: toolResult.fileRefs });
                   break;
 
-                case "web_search":
+                case "web_search": {
                   if (!perplexityKey) {
                     toolResult = { context: "", citations: [], domains: [], fileRefs: [], summary: "No search API configured" };
                   } else {
-                    emitThinking(`Searching across legal databases...`);
-                    toolResult = await toolWebSearch(nextInput.query || message, perplexityKey, currentSearchModel, sources, intent.jurisdictions, currentRE);
+                    // Select per-query Perplexity model based on complexity
+                    const { model: queryModel, reasoningEffort: queryRE } = selectPerplexityModel(complexity, !!deepResearch);
+
+                    if (subQueries.length > 1) {
+                      emitThinking(`Executing ${subQueries.length} targeted searches...`);
+                    } else {
+                      emitThinking(`Searching across legal databases...`);
+                    }
+
+                    // Execute sub-queries and merge results
+                    const mergedResult: ToolResult = { context: "", citations: [], domains: [], fileRefs: [], summary: "" };
+                    const seenUrls = new Set<string>();
+
+                    for (const sq of subQueries) {
+                      const partial = await toolWebSearch(sq, perplexityKey, queryModel, sources, intent.jurisdictions, queryRE);
+                      if (partial.context) mergedResult.context += partial.context + "\n\n";
+                      // Deduplicate citations by URL
+                      for (const c of partial.citations) {
+                        if (c.url && seenUrls.has(c.url)) continue;
+                        if (c.url) seenUrls.add(c.url);
+                        mergedResult.citations.push({ ...c, index: mergedResult.citations.length + 1 });
+                      }
+                      mergedResult.domains.push(...partial.domains);
+                    }
+                    mergedResult.domains = [...new Set(mergedResult.domains)];
+                    mergedResult.summary = `Found ${mergedResult.citations.length} sources from ${subQueries.length} searches`;
+
+                    toolResult = mergedResult;
                     webSearchDone = true;
                     if (toolResult.domains.length > 0) {
                       emit(controller, encoder, { type: "sources", urls: toolResult.citations.map(c => c.url).filter(Boolean), domains: toolResult.domains });
                     }
                   }
                   break;
+                }
 
                 case "read_files":
                   emitThinking("Reading document contents directly...");
                   toolResult = await toolReadFiles(orgId, vaultId, attachedFileIds, adminClient);
                   if (toolResult.fileRefs.length > 0) emit(controller, encoder, { type: "file_refs", files: toolResult.fileRefs });
                   break;
+
+                case "courtlistener": {
+                  emitThinking(`Searching CourtListener with ${subQueries.length} targeted queries...`);
+                  const mergedResult: ToolResult = { context: "", citations: [], domains: ["courtlistener.com"], fileRefs: [], summary: "" };
+                  const seenUrls = new Set<string>();
+
+                  for (const sq of subQueries) {
+                    const partial = await toolCourtListener(sq, courtListenerKey);
+                    if (partial.context) mergedResult.context += partial.context + "\n\n";
+                    for (const c of partial.citations) {
+                      if (c.url && seenUrls.has(c.url)) continue;
+                      if (c.url) seenUrls.add(c.url);
+                      mergedResult.citations.push({ ...c, index: mergedResult.citations.length + 1 });
+                    }
+                  }
+                  mergedResult.summary = `${mergedResult.citations.length} cases found from ${subQueries.length} queries`;
+                  toolResult = mergedResult;
+
+                  if (toolResult.domains.length > 0) {
+                    emit(controller, encoder, { type: "sources", urls: toolResult.citations.map(c => c.url).filter(Boolean), domains: toolResult.domains });
+                  }
+                  break;
+                }
+
+                case "edgar": {
+                  emitThinking(`Searching SEC EDGAR with ${subQueries.length} targeted queries...`);
+                  const mergedResult: ToolResult = { context: "", citations: [], domains: ["sec.gov"], fileRefs: [], summary: "" };
+                  const seenUrls = new Set<string>();
+
+                  for (const sq of subQueries) {
+                    const partial = await toolEdgar(sq, edgarUserAgent);
+                    if (partial.context) mergedResult.context += partial.context + "\n\n";
+                    for (const c of partial.citations) {
+                      if (c.url && seenUrls.has(c.url)) continue;
+                      if (c.url) seenUrls.add(c.url);
+                      mergedResult.citations.push({ ...c, index: mergedResult.citations.length + 1 });
+                    }
+                  }
+                  mergedResult.summary = `${mergedResult.citations.length} filings found from ${subQueries.length} queries`;
+                  toolResult = mergedResult;
+
+                  if (toolResult.domains.length > 0) {
+                    emit(controller, encoder, { type: "sources", urls: toolResult.citations.map(c => c.url).filter(Boolean), domains: toolResult.domains });
+                  }
+                  break;
+                }
+
+                case "eurlex": {
+                  emitThinking(`Searching EUR-Lex with ${subQueries.length} targeted queries...`);
+                  const mergedResult: ToolResult = { context: "", citations: [], domains: ["eur-lex.europa.eu"], fileRefs: [], summary: "" };
+                  const seenUrls = new Set<string>();
+
+                  for (const sq of subQueries) {
+                    const partial = await toolEurLex(sq);
+                    if (partial.context) mergedResult.context += partial.context + "\n\n";
+                    for (const c of partial.citations) {
+                      if (c.url && seenUrls.has(c.url)) continue;
+                      if (c.url) seenUrls.add(c.url);
+                      mergedResult.citations.push({ ...c, index: mergedResult.citations.length + 1 });
+                    }
+                  }
+                  mergedResult.summary = `${mergedResult.citations.length} EU law results from ${subQueries.length} queries`;
+                  toolResult = mergedResult;
+
+                  if (toolResult.domains.length > 0) {
+                    emit(controller, encoder, { type: "sources", urls: toolResult.citations.map(c => c.url).filter(Boolean), domains: toolResult.domains });
+                  }
+                  break;
+                }
 
                 default:
                   toolResult = { context: "", citations: [], domains: [], fileRefs: [], summary: "Unknown tool" };
@@ -861,8 +1728,46 @@ serve(async (req) => {
 
             trackStep(stepLabel, "done", toolResult.summary);
 
+            // ══ FORCE FINISH when attached files have been read ══
+            if (attachedFileIds?.length && nextTool === "read_files") {
+              if (toolResult.context) {
+                emitThinking("Documents loaded. Preparing analysis...");
+              } else {
+                // RED-FLAG HALLUCINATION GUARD: If read_files returned no content, do NOT proceed with red-flag analysis
+                if (effectiveMode === "red_flags") {
+                  emitThinking("Document is still processing or could not be read. Cannot perform red flag analysis without document content.");
+                  emit(controller, encoder, { type: "final_answer_start" });
+                  const noContentMsg = "⚠️ **Document Not Ready**\n\nThe document is still being processed or its content could not be extracted. Red flag analysis requires readable document content.\n\n**What to do:**\n1. Wait a moment for processing to complete, then try again\n2. If the issue persists, try re-uploading the document in PDF format\n3. Check that the file is not corrupted or password-protected";
+                  emit(controller, encoder, { type: "token", content: noContentMsg });
+                  emit(controller, encoder, { type: "done", citations: [], model: modelId, followUps: ["Try the red flag analysis again", "Check document processing status"] });
+                  // User message already saved in Phase 2.5
+                  if (conversationId && conversationId !== "column-fill") {
+                    const earlyMeta: any = { frozenFileRefs: allFileRefs };
+                    if (allFileRefs.length > 0) earlyMeta.redFlagTarget = { id: allFileRefs[0].id, name: allFileRefs[0].name };
+                    await adminClient.from("messages").insert({ conversation_id: conversationId, organization_id: orgId, role: "assistant", content: noContentMsg, model_used: modelId, metadata: earlyMeta });
+                  }
+                  controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+                  controller.close();
+                  return;
+                }
+              }
+              // But if there are queued legal tools, run those first
+              if (toolQueue.length > 0) {
+                nextTool = toolQueue.shift()!;
+                continue;
+              }
+              break;
+            }
+
+            // ══ QUEUED TOOLS: run remaining legal tools before monologue decides ══
+            if (toolQueue.length > 0) {
+              nextTool = toolQueue.shift()!;
+              nextInput = { query: message };
+              continue;
+            }
+
             // ── INNER MONOLOGUE ──
-            const monologue = await innerMonologue(aiUrl, aiKey, modelId, aiHeaders, message, currentPlan, accumulatedContext, toolResult, iteration, currentPlan.length);
+            const monologue = await innerMonologue(aiUrl, aiKey, modelId, aiHeaders, message, currentPlan, accumulatedContext, toolResult, iteration, currentPlan.length, attachedFileNames);
 
             emitThinking(monologue.thinking_narration);
 
@@ -913,7 +1818,7 @@ serve(async (req) => {
               nextInput = { query: message };
 
               // Re-run monologue to decide next step
-              const postVerify = await innerMonologue(aiUrl, aiKey, modelId, aiHeaders, message, currentPlan, accumulatedContext, toolResult, iteration, currentPlan.length);
+              const postVerify = await innerMonologue(aiUrl, aiKey, modelId, aiHeaders, message, currentPlan, accumulatedContext, toolResult, iteration, currentPlan.length, attachedFileNames);
               if (postVerify.next_action === "FINISH") break;
               nextTool = postVerify.next_tool || "";
               nextInput = postVerify.next_tool_input || { query: message };
@@ -921,26 +1826,47 @@ serve(async (req) => {
             }
 
             // Decide next action
-            // Check vault fallback: if vault returned irrelevant results, auto-switch to web
-            const vaultWasIrrelevant = monologue.vault_result_relevant === false;
-            if (monologue.next_action === "FINISH" && !vaultWasIrrelevant) {
-              nextTool = "";
-            } else if (vaultWasIrrelevant && !webSearchDone && perplexityKey) {
-              // Vault results irrelevant — auto fallback to web search
-              nextTool = "web_search";
-              nextInput = monologue.next_tool_input || { query: message };
-              emitThinking("Document results not relevant to query. Searching online sources...");
-              // Clear irrelevant vault citations
-              allCitations = allCitations.filter(c => c.url);
-              allFileRefs = [];
-            } else if (monologue.next_action === "TOOL" && monologue.next_tool) {
-              nextTool = monologue.next_tool;
-              nextInput = monologue.next_tool_input || { query: message };
+            // HARD GUARD: If explicit files are attached, only allow web_search (never vault_search or read_files again)
+            if (attachedFileIds?.length) {
+              if (monologue.next_action === "FINISH") {
+                nextTool = "";
+              } else if (monologue.next_tool === "web_search" && !webSearchDone && perplexityKey) {
+                nextTool = "web_search";
+                nextInput = monologue.next_tool_input || { query: message };
+              } else {
+                // Force finish — don't let monologue loop with vault_search or read_files
+                nextTool = "";
+              }
             } else {
-              // Default: if vault not searched and available, do that; else if web not searched, do that; else finish
-              if (!vaultSearchDone && hasVault) { nextTool = "vault_search"; }
-              else if (!webSearchDone && perplexityKey) { nextTool = "web_search"; }
-              else { nextTool = ""; }
+              // Check vault fallback: if vault returned irrelevant results, auto-switch to web
+              const vaultWasIrrelevant = monologue.vault_result_relevant === false;
+              if (monologue.next_action === "FINISH" && !vaultWasIrrelevant) {
+                nextTool = "";
+              } else if (vaultWasIrrelevant && !webSearchDone && perplexityKey) {
+                nextTool = "web_search";
+                nextInput = monologue.next_tool_input || { query: message };
+                emitThinking("Document results not relevant to query. Searching online sources...");
+                allCitations = allCitations.filter(c => c.url);
+                allFileRefs = [];
+              } else if (monologue.next_action === "TOOL" && monologue.next_tool) {
+                // Blacklist tools that exceeded retry cap
+                if ((toolAttempts[monologue.next_tool] || 0) >= 2) {
+                  // Don't let monologue re-queue a failed tool
+                  if (perplexityKey && !webSearchDone) {
+                    nextTool = "web_search";
+                    nextInput = { query: `site:${monologue.next_tool === "courtlistener" ? "courtlistener.com" : "sec.gov"} ${message}` };
+                  } else {
+                    nextTool = "";
+                  }
+                } else {
+                  nextTool = monologue.next_tool;
+                  nextInput = monologue.next_tool_input || { query: message };
+                }
+              } else {
+                if (!vaultSearchDone && hasVault) { nextTool = "vault_search"; }
+                else if (!webSearchDone && perplexityKey) { nextTool = "web_search"; }
+                else { nextTool = ""; }
+              }
             }
           }
 
@@ -984,14 +1910,65 @@ serve(async (req) => {
 
           const followUpInstruction = `\n\nIMPORTANT: At the end of your response, always suggest 3 relevant follow-up questions the user might want to ask. Format each as ">>FOLLOWUP: [question]" on its own line. Make them specific and actionable based on the conversation context.`;
 
+          const redFlagModePrompt = effectiveMode === "red_flags" ? `
+You are LawKit AI performing Red Flag Analysis.
+
+CRITICAL GROUNDING RULE: You MUST analyze ONLY the document content provided in the '## Document Contents' section below. Do not reference any other documents from memory, training data, or previous sessions. If the document content references parties, terms, dates, or jurisdictions, use ONLY those exact details. Never fabricate or substitute party names, dates, or clause text.
+
+Read the ENTIRE provided document carefully. For every risky, unusual, or potentially unfavorable clause:
+
+OUTPUT FORMAT — you MUST use this exact format:
+<!-- REDFLAGS: [Document Title] -->
+\`\`\`json
+{
+  "flags": [
+    {
+      "clause_text": "exact verbatim quote from the document — copy word for word",
+      "risk_level": "CRITICAL|HIGH|MEDIUM|LOW",
+      "category": "liability|IP|termination|payment|governance|data_protection|confidentiality|indemnification|non_compete|representations",
+      "reason": "Clear explanation of why this clause is risky",
+      "suggested_edit": "Specific rewrite of the clause to address the risk"
+    }
+  ],
+  "summary": {
+    "total": N,
+    "critical": N,
+    "high": N,
+    "medium": N,
+    "low": N,
+    "risk_score": N  // overall risk score 0-10. This is a holistic assessment, NOT a sum of individual flags. 0=no risk, 10=extreme risk.
+  }
+}
+\`\`\`
+
+Risk levels:
+- CRITICAL = must fix before signing, creates serious legal exposure
+- HIGH = strongly recommended to fix, significant risk
+- MEDIUM = worth negotiating, moderate concern
+- LOW = minor issue, note only
+
+JURISDICTION RULE: Only flag governing law as a risk if the jurisdiction is clearly mismatched with the parties' stated locations, or if the jurisdiction is unusual for the contract type. Do NOT flag a jurisdiction simply because it differs from England and Wales — assess based on the parties involved.
+
+Before the REDFLAGS block, write a brief 2-3 sentence overview of the document and overall risk assessment.
+After the REDFLAGS block, write ONLY key recommendations that are DIFFERENT from the overview. Do NOT repeat the overview paragraph. Keep recommendations actionable and specific.
+${followUpInstruction}
+` : "";
+
           const draftingModePrompt = effectiveMode === "drafting" ? `
 You are LawKit AI, an expert legal document drafting assistant.
 CRITICAL RULES:
 - You MUST generate a complete, properly formatted legal document. NEVER output JSON, extraction data, or structured data.
-- Start with "# [Document Title]" followed by the full document body.
-- Use proper legal formatting: numbered sections, subsections, defined terms in bold, signature blocks.
-- Fill in ALL details using user info and org context. NEVER use placeholder text.
+- Start your response with "# [Document Title]" as the FIRST line. Do NOT include any conversational preamble, explanations, caveats, "as an AI..." text, or any text before the document title heading. The very first character of your output must be "#".
+- Use proper legal formatting: numbered sections (1., 1.1, 1.2), subsections, defined terms in **bold**, signature blocks.
+- Fill in ALL details using user info and org context. NEVER use placeholder text like [PARTY NAME].
 - Include all standard clauses expected for the document type.
+- RESEARCH jurisdiction requirements BEFORE drafting — ensure compliance with applicable laws.
+- Unless the user specifies a jurisdiction, always draft under the laws of England and Wales with exclusive jurisdiction of the courts of England and Wales. Never default to US law (California, New York, etc.).
+- End the document with a "## Drafting Notes" section explaining key decisions, assumptions made, and any areas requiring client review.
+- Use clear modern legal language — avoid archaic legalese.
+- When the user requests multiple documents (e.g., "write 5 NDAs"), draft ALL of them in sequence within the same response. Use placeholder party names (Vendor 1, Vendor 2, Party A, etc.), England and Wales as default governing law, and 2-year confidentiality period as default unless specified. List all assumptions in the Drafting Notes at the end.
+- NEVER say "I can only generate one document at a time". Generate as many documents as requested.
+- Only ask for clarification if ZERO information was provided about the document type or purpose. If the user has specified a purpose, document type, or said details should be random/varied, proceed immediately with reasonable defaults and placeholders. Never ask for information the user has already implicitly or explicitly provided.
 ${followUpInstruction}
 ` : "";
 
@@ -1005,12 +1982,56 @@ Format:
 {"columns":[{"name":"Col","type":"free_response","query":"..."}],"rows":[{"fileName":"f.pdf","status":"completed","values":{"Col":"val"}}]}
 \`\`\`
 Column types: "free_response", "date", "classification", "verbatim", "number"
+
+## EXTRACTION GROUNDING RULES (MANDATORY)
+
+### Rule 1 — NOT FOUND (prevents all fabrication)
+For every cell you extract, you MUST be able to quote a verbatim sentence from the document.
+If you cannot quote a verbatim sentence → the value does not exist in this document.
+If a field is absent, return the value as: "NOT FOUND IN DOCUMENT"
+NEVER infer, estimate, or use training data to fill a cell.
+NEVER populate a cell you cannot directly quote from the document.
+
+### Rule 2 — Governing Law Grounding (prevents jurisdiction hallucination)
+WHEN extracting Governing Law:
+Only read the explicit governing law clause — typically in a final section titled "Governing Law" or "Governing Law and Jurisdiction".
+DO NOT infer governing law from the investor's address, the LP's name or nationality, the currency used, or any other contextual signal.
+If no explicit clause exists → return NOT FOUND IN DOCUMENT.
+
+### Rule 3 — Document Type Awareness (prevents inventing clauses)
+WHEN processing LP side letters:
+These documents contain: economic terms, MFN rights, co-investment rights, reporting rights, key person provisions, governing law.
+These documents DO NOT contain: liability caps, auto-renewal clauses, termination notice periods, indemnification terms. These live in the LPA itself.
+If asked to extract an absent clause type → return NOT FOUND IN DOCUMENT.
+DO NOT invent typical values. DO NOT infer from the LPA.
+
+### Rule 4 — Payment Term Precision
+WHEN extracting payment terms, extract all sub-values separately:
+- Management fee (Investment Period)
+- Management fee (post-Investment Period)
+- Carried interest rate
+- Hurdle / preferred return rate
+- Management fee offset % (only if explicitly stated)
+DO NOT use industry-standard or typical values.
+Omit any sub-value not stated in the document.
+
+### Rule 5 — Per-Document Independence (prevents context drift)
+Apply ALL grounding rules independently for EACH document. Do not let the extraction from document 1 influence document 2.
+Do not infer any document's governing law from LP identity, address, or nationality.
+Each document must be read as if it is the only document you have ever seen.
+The governing law of document 1 has ZERO bearing on document 2. Re-read the governing law clause fresh for each document.
+
+### Rule 6 — Self-Verification (prevents hallucination)
+After extracting governing law from each document, state the verbatim sentence you found in a "verification" field in the row values.
+If the verbatim sentence does not contain the jurisdiction you extracted, your extraction is wrong — re-read the document.
+Format: "values": { "Governing Law": "laws of England and Wales", "Governing Law Verification": "This Agreement shall be governed by and construed in accordance with the laws of England and Wales." }
+
 ${followUpInstruction}
 ` : "";
 
           let documentEditingContext = "";
           if (currentDocumentContent) {
-            documentEditingContext = `\n\n## Currently Open Document (VERSION UPDATE MODE)\nUPDATE the existing document, do NOT create new. Output COMPLETE updated document with "# [Same Title]".\n\nCurrent:\n${currentDocumentContent.substring(0, 10000)}`;
+            documentEditingContext = `\n\n## Currently Open Document (VERSION UPDATE MODE)\nWhen the user asks to modify a document, output the COMPLETE updated document as markdown starting with "# [Same Title]".\nNEVER output JSON operations, file_path objects, or structured edit instructions. Always output the full updated document text.\nUPDATE the existing document, do NOT create new.\n\nCurrent:\n${currentDocumentContent.substring(0, 10000)}`;
           }
 
           const basePrompt = customPrompt || getLawKitBasePrompt(
@@ -1019,10 +2040,15 @@ ${followUpInstruction}
           );
 
           const allContext = accumulatedContext.join("\n");
-          const effectiveBasePrompt = draftingModePrompt || reviewModePrompt || (basePrompt + followUpInstruction);
+          const effectiveBasePrompt = redFlagModePrompt || draftingModePrompt || reviewModePrompt || (basePrompt + followUpInstruction);
           let finalSystemPrompt = effectiveBasePrompt;
           if (workflowSystemPrompt) finalSystemPrompt = workflowSystemPrompt + "\n\n" + finalSystemPrompt;
-          finalSystemPrompt += `\n${knowledgeContext}\n${vaultInventory}\n${allContext}\n${documentEditingContext}`;
+          finalSystemPrompt += `\n${knowledgeContext}\n${agentMemoryContext}\n${vaultInventory}\n${allContext}\n${documentEditingContext}`;
+
+          // Inject explicit attachment context into synthesis prompt
+          if (attachedFileIds?.length && attachedFileNames?.length) {
+            finalSystemPrompt += `\n\n## EXPLICIT ATTACHMENTS\nThe user explicitly attached these files for analysis: ${attachedFileNames.join(", ")}. Analyze ALL attached files directly. Do NOT ask which file to analyze. Do NOT search the vault for other files. The attached files ARE your scope.`;
+          }
 
           // Build messages
           const aiMessages = [
@@ -1031,16 +2057,13 @@ ${followUpInstruction}
             { role: "user", content: message },
           ];
 
-          // Save user message
-          if (conversationId && conversationId !== "column-fill") {
-            await adminClient.from("messages").insert({ conversation_id: conversationId, organization_id: orgId, role: "user", content: message });
-          }
+          // User message already saved in Phase 2.5 (early insert)
 
           // Stream final synthesis
           const aiResponse = await fetch(aiUrl, {
             method: "POST",
             headers: aiHeaders,
-            body: JSON.stringify({ model: modelId, messages: aiMessages, stream: true, max_tokens: deepResearch ? 8192 : 4096, temperature: 0.3 }),
+            body: JSON.stringify({ model: modelId, messages: aiMessages, stream: true, max_tokens: effectiveMode === "drafting" ? 16384 : (deepResearch ? 16000 : 8000), temperature: 0.3 }),
           });
 
           if (!aiResponse.ok) {
@@ -1067,6 +2090,8 @@ ${followUpInstruction}
           let reasoningContent = "";
           let buffer = "";
           let inThinkBlock = false;
+          let firstTokensBuffer = ""; // Buffer first tokens to strip bad openers
+          let firstTokensEmitted = false;
 
           while (true) {
             const { done, value } = await reader.read();
@@ -1108,8 +2133,27 @@ ${followUpInstruction}
                         remaining = remaining.slice(openIdx + 7);
                         inThinkBlock = true;
                       } else {
-                        fullContent += remaining;
-                        emit(controller, encoder, { type: "token", content: remaining });
+                        // Post-processing: buffer first ~150 chars to strip bad openers
+                        if (!firstTokensEmitted) {
+                          firstTokensBuffer += remaining;
+                          fullContent += remaining;
+                          remaining = "";
+                          if (firstTokensBuffer.length >= 150) {
+                            // Check and strip bad openers
+                            let cleaned = firstTokensBuffer;
+                            const badOpenerMatch = cleaned.match(/^(I don't have sufficient information[^.]*\.|I do not have sufficient[^.]*\.|My internal knowledge[^.]*\.|Unfortunately,? I[^.]*\.)\s*/i);
+                            if (badOpenerMatch) {
+                              cleaned = cleaned.slice(badOpenerMatch[0].length);
+                              // Also fix fullContent
+                              fullContent = fullContent.slice(badOpenerMatch[0].length);
+                            }
+                            emit(controller, encoder, { type: "token", content: cleaned });
+                            firstTokensEmitted = true;
+                          }
+                        } else {
+                          fullContent += remaining;
+                          emit(controller, encoder, { type: "token", content: remaining });
+                        }
                         remaining = "";
                       }
                     }
@@ -1117,6 +2161,17 @@ ${followUpInstruction}
                 }
               } catch { /* partial JSON */ }
             }
+          }
+
+          // Flush any remaining buffered first tokens
+          if (!firstTokensEmitted && firstTokensBuffer.length > 0) {
+            let cleaned = firstTokensBuffer;
+            const badOpenerMatch = cleaned.match(/^(I don't have sufficient information[^.]*\.|I do not have sufficient[^.]*\.|My internal knowledge[^.]*\.|Unfortunately,? I[^.]*\.)\s*/i);
+            if (badOpenerMatch) {
+              cleaned = cleaned.slice(badOpenerMatch[0].length);
+              fullContent = fullContent.slice(badOpenerMatch[0].length);
+            }
+            emit(controller, encoder, { type: "token", content: cleaned });
           }
 
           // Extract follow-ups
@@ -1154,6 +2209,10 @@ ${followUpInstruction}
             messageMetadata.frozenSearchSources = { urls: allCitations.filter(c => c.url).map(c => c.url), domains: [...new Set(allDomains)] };
           }
           if (allFileRefs.length > 0) messageMetadata.frozenFileRefs = allFileRefs;
+          // Persist deterministic red-flag target for reload-safe "Open in Editor"
+          if (effectiveMode === "red_flags" && allFileRefs.length > 0) {
+            messageMetadata.redFlagTarget = { id: allFileRefs[0].id, name: allFileRefs[0].name };
+          }
           messageMetadata.agentMeta = {
             iterations: iteration,
             complexity,
@@ -1175,6 +2234,75 @@ ${followUpInstruction}
               const title = cleanedContent.substring(0, 60).replace(/[#*\n]/g, "").trim() + (cleanedContent.length > 60 ? "..." : "");
               await adminClient.from("conversations").update({ title }).eq("id", conversationId);
             }
+          }
+
+          // ════════════════════════════════════
+          // PHASE 7: SAVE AGENT MEMORY
+          // ════════════════════════════════════
+          try {
+            const memoryResp = await fetch(aiUrl, {
+              method: "POST",
+              headers: aiHeaders,
+              body: JSON.stringify({
+                model: modelId,
+                messages: [
+                  { role: "system", content: `Extract key legal facts from this conversation exchange as a JSON array. Each fact should be an object with: {type, field, value, source_doc?}.
+Types: "user_standard" (user's stated standard terms/preferences), "document_reviewed" (key facts from reviewed documents), "decision_made" (decisions or conclusions reached), "preference" (user workflow/style preferences).
+Only extract CONCRETE facts: specific durations, jurisdictions, names, rates, amounts, dates, governing laws.
+Skip generic observations like "user asked about NDAs" — only save facts that would be useful in future sessions.
+If no concrete facts exist, output an empty array: []
+Output ONLY the JSON array, no other text.` },
+                  { role: "user", content: `User: ${message}\n\nAssistant: ${cleanedContent.substring(0, 3000)}` },
+                ],
+                max_tokens: 500,
+                temperature: 0,
+              }),
+            });
+            if (memoryResp.ok) {
+              const memData = await memoryResp.json();
+              const memoryRaw = memData.choices?.[0]?.message?.content?.trim();
+              if (memoryRaw) {
+                try {
+                  // Parse JSON array of facts
+                  const jsonMatch = memoryRaw.match(/\[[\s\S]*\]/);
+                  const facts = jsonMatch ? JSON.parse(jsonMatch[0]) : [];
+                  if (Array.isArray(facts) && facts.length > 0) {
+                    for (const fact of facts) {
+                      if (!fact.field || !fact.value) continue;
+                      const factContent = `${fact.field}: ${fact.value}${fact.source_doc ? ` (from: ${fact.source_doc})` : ""}`;
+                      const category = fact.type || "general";
+
+                      // Supersession: delete existing entries with the same field for this user
+                      const { data: existing } = await adminClient.from("agent_memory")
+                        .select("id, content")
+                        .eq("organization_id", orgId)
+                        .eq("user_id", userId)
+                        .ilike("content", `${fact.field}:%`)
+                        .limit(5);
+                      if (existing?.length) {
+                        await adminClient.from("agent_memory").delete().in("id", existing.map((e: any) => e.id));
+                      }
+
+                      await adminClient.from("agent_memory").insert({
+                        organization_id: orgId, user_id: userId, content: factContent, category,
+                      });
+                    }
+                    // Prune old entries — keep only last 50 per user
+                    const { data: oldEntries } = await adminClient.from("agent_memory").select("id").eq("organization_id", orgId).eq("user_id", userId).order("created_at", { ascending: false }).range(50, 1000);
+                    if (oldEntries?.length) {
+                      await adminClient.from("agent_memory").delete().in("id", oldEntries.map((e: any) => e.id));
+                    }
+                  }
+                } catch (parseErr) {
+                  // Fallback: save as-is if JSON parse fails
+                  await adminClient.from("agent_memory").insert({
+                    organization_id: orgId, user_id: userId, content: memoryRaw.substring(0, 500), category: intent.taskType || "general",
+                  });
+                }
+              }
+            }
+          } catch (memErr) {
+            console.error("Agent memory save error:", memErr);
           }
 
           controller.enqueue(encoder.encode("data: [DONE]\n\n"));
@@ -1208,21 +2336,40 @@ function extractCitations(content: string, vaultContext: string): { index: numbe
   const citations: { index: number; source: string; excerpt: string }[] = [];
   const seen = new Set<number>();
 
+  // Count how many actual document sections exist in vault context to know valid index range
+  const maxDocIndex = (vaultContext.match(/### \[\d+\]/g) || []).length;
+
   for (const match of content.matchAll(/\[(\d+)\]/g)) {
     const idx = parseInt(match[1]);
     if (seen.has(idx)) continue;
+
+    // YEAR BRACKET GUARD: Skip numbers that look like years (1900-2099) unless they're within valid citation range
+    if (idx >= 1900 && idx <= 2099 && idx > maxDocIndex && idx > 50) continue;
+
     seen.add(idx);
     const docMatch = vaultContext.match(new RegExp(`### \\[${idx}\\] (.+?)\\n([\\s\\S]*?)(?=### \\[|$)`));
-    citations.push({ index: idx, source: docMatch?.[1] || `Source ${idx}`, excerpt: docMatch?.[2]?.substring(0, 200)?.trim() || "" });
+    // Only create citation if we have a matching document section OR the index is within known range
+    if (docMatch) {
+      citations.push({ index: idx, source: docMatch[1], excerpt: docMatch[2]?.substring(0, 200)?.trim() || "" });
+    } else if (idx <= maxDocIndex || idx <= 30) {
+      // Reasonable citation index — keep as fallback
+      citations.push({ index: idx, source: `Source ${idx}`, excerpt: "" });
+    }
+    // Skip large numbers with no matching doc (likely year brackets like [2015], [2022])
   }
 
   for (const match of content.matchAll(/[\u2070\u00b9\u00b2\u00b3\u2074-\u2079]+/g)) {
     const digits = match[0].split("").map(c => SUPERSCRIPT_DIGITS[c] || c).join("");
     const idx = parseInt(digits);
     if (isNaN(idx) || seen.has(idx)) continue;
+    if (idx >= 1900 && idx <= 2099 && idx > maxDocIndex && idx > 50) continue;
     seen.add(idx);
     const docMatch = vaultContext.match(new RegExp(`### \\[${idx}\\] (.+?)\\n([\\s\\S]*?)(?=### \\[|$)`));
-    citations.push({ index: idx, source: docMatch?.[1] || `Source ${idx}`, excerpt: docMatch?.[2]?.substring(0, 200)?.trim() || "" });
+    if (docMatch) {
+      citations.push({ index: idx, source: docMatch[1], excerpt: docMatch[2]?.substring(0, 200)?.trim() || "" });
+    } else if (idx <= maxDocIndex || idx <= 30) {
+      citations.push({ index: idx, source: `Source ${idx}`, excerpt: "" });
+    }
   }
 
   return citations;
