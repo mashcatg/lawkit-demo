@@ -1,0 +1,109 @@
+import { useState } from "react";
+import { useNavigate } from "react-router-dom";
+import { supabase } from "@/integrations/supabase/client";
+import { useAuth } from "@/contexts/AuthContext";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { useToast } from "@/hooks/use-toast";
+import { useEffect } from "react";
+
+export default function Onboarding() {
+  const [orgName, setOrgName] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const { user, profile, refreshProfile, session } = useAuth();
+  const navigate = useNavigate();
+  const { toast } = useToast();
+
+  useEffect(() => {
+    if (!session) navigate("/auth", { replace: true });
+    if (profile?.organization_id) navigate("/", { replace: true });
+  }, [session, profile, navigate]);
+
+  const handleCreateOrg = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!user) return;
+    setSubmitting(true);
+
+    // Ensure the Supabase client is primed with the latest auth tokens
+    // (prevents DB requests being sent without the JWT in some environments)
+    if (session?.access_token && session?.refresh_token) {
+      const { error: setSessionError } = await supabase.auth.setSession({
+        access_token: session.access_token,
+        refresh_token: session.refresh_token,
+      });
+      if (setSessionError) console.warn("[onboarding] setSession error", setSessionError);
+    }
+
+    try {
+      const slug = orgName.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "");
+      const orgId = crypto.randomUUID();
+
+      // Create org — no .select() to avoid RLS SELECT policy blocking RETURNING
+      const { error: orgError } = await supabase
+        .from("organizations")
+        .insert({ id: orgId, name: orgName, slug });
+      if (orgError) {
+        if (orgError.code === "23505") throw new Error("Organization name already exists, try another name.");
+        throw orgError;
+      }
+
+      // Upsert profile as member first (RLS requires role = 'member' on insert)
+      const { error: profileError } = await supabase
+        .from("profiles")
+        .upsert({
+          id: user.id,
+          email: user.email!,
+          organization_id: orgId,
+          role: "member" as const,
+          full_name: user.user_metadata?.full_name || user.email?.split("@")[0],
+        }, { onConflict: "id" });
+      if (profileError) throw profileError;
+
+      // Promote to admin via server-side security definer function
+      const { error: promoteError } = await supabase.rpc("promote_org_creator", {
+        _user_id: user.id,
+        _org_id: orgId,
+      });
+      if (promoteError) throw promoteError;
+
+      // Create default vault
+      await supabase.from("vaults").insert({
+        name: "General",
+        description: "Default document vault",
+        organization_id: orgId,
+        created_by: user.id,
+      });
+
+      await refreshProfile();
+      navigate("/", { replace: true });
+    } catch (err: any) {
+      toast({ title: "Error", description: err.message, variant: "destructive" });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="flex min-h-screen items-center justify-center bg-background p-4">
+      <Card className="w-full max-w-md border border-border shadow-none">
+        <CardHeader className="text-center">
+          <CardTitle className="font-heading text-2xl">Set Up Your Organization</CardTitle>
+          <CardDescription>Create your firm's workspace to get started.</CardDescription>
+        </CardHeader>
+        <CardContent>
+          <form onSubmit={handleCreateOrg} className="space-y-4">
+            <div className="space-y-2">
+              <Label htmlFor="orgName">Organization Name</Label>
+              <Input id="orgName" value={orgName} onChange={(e) => setOrgName(e.target.value)} placeholder="e.g. Smith & Associates" required />
+            </div>
+            <Button type="submit" className="w-full" disabled={submitting}>
+              {submitting ? "Creating..." : "Create Organization"}
+            </Button>
+          </form>
+        </CardContent>
+      </Card>
+    </div>
+  );
+}
