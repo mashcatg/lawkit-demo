@@ -143,23 +143,6 @@ const PPLX_SYSTEM: Record<string, string> = {
   "sonar-deep-research": "You are a senior legal researcher conducting comprehensive multi-source analysis. Analyze multiple jurisdictions and provide exhaustive citations.",
 };
 
-const DEFAULT_AI_MODEL = "google/gemini-2.5-flash";
-
-function getAiGatewayConfig() {
-  return {
-    aiUrl: Deno.env.get("AI_GATEWAY_URL") || Deno.env.get("OPENAI_COMPAT_URL") || "",
-    aiKey: Deno.env.get("AI_GATEWAY_API_KEY") || Deno.env.get("OPENAI_API_KEY") || "",
-  };
-}
-
-function normalizeModelId(modelId?: string | null): string | undefined {
-  if (!modelId) return undefined;
-  if (modelId.includes("/")) return modelId;
-  if (modelId.startsWith("gemini")) return `google/${modelId}`;
-  if (modelId.startsWith("gpt")) return `openai/${modelId}`;
-  return modelId;
-}
-
 // ──────────────────────────────────────────────
 // SSE Emitters
 // ──────────────────────────────────────────────
@@ -642,21 +625,14 @@ serve(async (req) => {
 
     // ──────── COLUMN FILL (non-streaming, preserved as-is) ────────
     if (useCase === "column_fill" && columnMeta) {
-      const gatewayConfig = getAiGatewayConfig();
-      let aiUrl = gatewayConfig.aiUrl;
-      let aiKey = gatewayConfig.aiKey;
-      let modelId = DEFAULT_AI_MODEL;
+      let aiUrl = "https://ai.gateway.lovable.dev/v1/chat/completions";
+      let aiKey = Deno.env.get("LOVABLE_API_KEY") || "";
+      let modelId = "google/gemini-2.5-flash";
       const { data: llmConfigs } = await adminClient.from("llm_configs").select("*").or(`organization_id.eq.${orgId},organization_id.is.null`).eq("is_active", true).eq("use_case", "extraction").order("is_default", { ascending: false }).limit(1);
       if (llmConfigs?.[0]) {
-        const llmConfig = llmConfigs[0];
-        modelId = normalizeModelId(llmConfig.model_id) || modelId;
-        aiUrl = llmConfig.base_url || aiUrl;
-        if (llmConfig.api_key_encrypted) {
-          aiKey = await decryptApiKey(llmConfig.api_key_encrypted, llmConfig.api_key_iv || "");
-        }
-      }
-      if (!aiUrl || !aiKey) {
-        return new Response(JSON.stringify({ error: "AI gateway is not configured", values: {} }), { status: 500, headers: { ...corsHeaders, "Content-Type": "application/json" } });
+        let m = llmConfigs[0].model_id;
+        if (m && !m.includes("/")) { if (m.startsWith("gemini")) m = `google/${m}`; else if (m.startsWith("gpt")) m = `openai/${m}`; }
+        modelId = m || modelId;
       }
       const fileNamesList = fileNames || existingSheet?.rows?.map((r: any) => r.fileName) || [];
       let fileContentContext = "";
@@ -711,21 +687,17 @@ serve(async (req) => {
     const hasVault = !!(attachedFileIds?.length) || !!(vaultId && !isUploadsVaultEarly);
 
     // ──────── RESOLVE AI CONFIG ────────
-    const gatewayConfig = getAiGatewayConfig();
-    let aiUrl = gatewayConfig.aiUrl;
-    let aiKey = gatewayConfig.aiKey;
-    let modelId = DEFAULT_AI_MODEL;
+    let aiUrl = "https://ai.gateway.lovable.dev/v1/chat/completions";
+    let aiKey = Deno.env.get("LOVABLE_API_KEY") || "";
+    let modelId = "google/gemini-2.5-flash";
+    let aiHeaders: Record<string, string> = { Authorization: `Bearer ${aiKey}`, "Content-Type": "application/json" };
 
     const { data: llmConfigs } = await adminClient.from("llm_configs").select("*").or(`organization_id.eq.${orgId},organization_id.is.null`).eq("is_active", true).eq("use_case", "chat").order("is_default", { ascending: false }).limit(1);
     if (llmConfigs?.[0]) {
-      const llmConfig = llmConfigs[0];
-      modelId = normalizeModelId(llmConfig.model_id) || modelId;
-      aiUrl = llmConfig.base_url || aiUrl;
-      if (llmConfig.api_key_encrypted) {
-        aiKey = await decryptApiKey(llmConfig.api_key_encrypted, llmConfig.api_key_iv || "");
-      }
+      let m = llmConfigs[0].model_id;
+      if (m && !m.includes("/")) { if (m.startsWith("gemini")) m = `google/${m}`; else if (m.startsWith("gpt")) m = `openai/${m}`; }
+      modelId = m || modelId;
     }
-    let aiHeaders: Record<string, string> = { Authorization: `Bearer ${aiKey}`, "Content-Type": "application/json" };
 
     // Load Perplexity key
     let perplexityKey = "";
@@ -1058,12 +1030,6 @@ ${followUpInstruction}
             ...conversationHistory.map((m: any) => ({ role: m.role, content: m.content })),
             { role: "user", content: message },
           ];
-
-          if (!aiUrl || !aiKey) {
-            emit(controller, encoder, { type: "error", error: "AI gateway is not configured" });
-            controller.close();
-            return;
-          }
 
           // Save user message
           if (conversationId && conversationId !== "column-fill") {
